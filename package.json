@@ -1,0 +1,26 @@
+{
+  "name": "blur-agent",
+  "version": "0.1.0",
+  "description": "Agent subsystem for blur-ai-runtime — durable AI-session identity. Wraps pool.lease() to give every project-attached AI session a typed Agent record with role, bindings, handoff pointer, and structured notes that survive session swaps.",
+  "license": "UNLICENSED",
+  "private": true,
+  "main": "dist/pack/index.js",
+  "scripts": {
+    "build": "tsc"
+  },
+  "blur": {
+    "packs": [
+      "dist/pack"
+    ]
+  },
+  "dependencies": {
+    "blur-ai-runtime": "file:../blur-ai-runtime"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

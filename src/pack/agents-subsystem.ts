@@ -1,0 +1,588 @@
+/**
+ * AgentsSubsystem — durable AI-session identity layer.
+ *
+ * Mounted at the short name `agents`. Implements Persistable
+ * (decision 20) so Agent records survive runtime restart at
+ * ~/.blur/persist/blur-agent/.
+ *
+ * State shape:
+ *   in-memory:
+ *     - byId: Map<agentId, Agent>            (single source of truth)
+ *     - sessionIndex: Map<sessionId, agentId> (whoAmI fast-path)
+ *     - rolesById: Map<roleId, AgentRoleDef>  (open registry)
+ *   on disk:
+ *     - { agents: Agent[], roles: AgentRoleDef[] } via Persistable.saveJson
+ *
+ * pool interaction:
+ *   The subsystem holds no hard import on blur-session-pool. It resolves
+ *   the pool node lazily via `runtime.extensions.get('pool')` — same
+ *   pattern blur-arc uses to reach blur-decisions. Lease/release degrade
+ *   gracefully when pool is absent (leasedFrom='manual' agents still
+ *   work; only 'pool' leases require the extension).
+ *
+ * audit-emit (decision 21) — every transition fires a semantic event so
+ * downstream packs (Conductor, project subsystem, audit-frame stamper)
+ * can subscribe. Kinds: agents.leased, agents.released, agents.bound,
+ * agents.unbound, agents.note-added, agents.session-swapped,
+ * agents.role-registered, agents.role-unregistered.
+ */
+
+import { randomUUID } from 'crypto';
+import type { BlurAIRuntime } from 'blur-ai-runtime';
+import type {
+  AddNoteOpts,
+  Agent,
+  AgentBinding,
+  AgentNote,
+  AgentRoleDef,
+  AgentStatus,
+  BindOpts,
+  LeaseOpts,
+  ListOpts,
+  RegisterRoleOpts,
+  ReleaseOpts,
+  UnbindOpts,
+  UnregisterRoleOpts,
+  WhoAmIOpts,
+} from './types';
+
+interface PersistedShape {
+  agents: Agent[];
+  roles: AgentRoleDef[];
+}
+
+type SemanticKind =
+  | 'agents.leased'
+  | 'agents.released'
+  | 'agents.bound'
+  | 'agents.unbound'
+  | 'agents.note-added'
+  | 'agents.session-swapped'
+  | 'agents.role-registered'
+  | 'agents.role-unregistered';
+
+/** Minimal pool API we use. Resolved lazily via runtime.extensions.get('pool'). */
+interface PoolBridge {
+  lease(opts?: { host?: string; role?: string; ttlSec?: number }): Promise<{
+    host: string;
+    sessionId: string;
+    sessionTitle: string;
+    leaseToken: string;
+  }>;
+  release(leaseToken: string): Promise<{ released: true }>;
+}
+
+export class AgentsSubsystem {
+  private byId = new Map<string, Agent>();
+  private sessionIndex = new Map<string, string>(); // sessionId → agentId
+  private rolesById = new Map<string, AgentRoleDef>();
+
+  constructor(public readonly runtime: BlurAIRuntime) {}
+
+  // ===================================================================
+  // Role catalog
+  // ===================================================================
+
+  registerRole(opts: RegisterRoleOpts): AgentRoleDef {
+    if (!opts || !opts.role || typeof opts.role.id !== 'string' || !opts.role.id.trim()) {
+      throw new Error('agents.roles.register: role.id is required');
+    }
+    if (typeof opts.role.label !== 'string' || !opts.role.label) {
+      throw new Error('agents.roles.register: role.label is required');
+    }
+    if (typeof opts.role.description !== 'string') {
+      throw new Error('agents.roles.register: role.description is required');
+    }
+    const id = opts.role.id.trim();
+    const now = new Date().toISOString();
+    const def: AgentRoleDef = {
+      ...opts.role,
+      id,
+      registeredAt: now,
+      registeredBy: opts.by,
+    };
+    this.rolesById.set(id, def);
+    this.emitEvent('agents.role-registered', {
+      ref: `item:agents.roles[${id}]`,
+      data: { roleId: id, by: opts.by },
+    });
+    return { ...def };
+  }
+
+  unregisterRole(opts: UnregisterRoleOpts): boolean {
+    if (!opts || typeof opts.id !== 'string' || !opts.id) {
+      throw new Error('agents.roles.unregister: id is required');
+    }
+    const existed = this.rolesById.delete(opts.id);
+    if (existed) {
+      this.emitEvent('agents.role-unregistered', {
+        ref: `item:agents.roles[${opts.id}]`,
+        data: { roleId: opts.id, by: opts.by },
+      });
+    }
+    return existed;
+  }
+
+  listRoles(): AgentRoleDef[] {
+    return [...this.rolesById.values()].map((r) => ({ ...r }));
+  }
+
+  getRole(id: string): AgentRoleDef | null {
+    const r = this.rolesById.get(id);
+    return r ? { ...r } : null;
+  }
+
+  // ===================================================================
+  // Lease / release lifecycle
+  // ===================================================================
+
+  /**
+   * Lease an Agent. Default path: takes a pool session via
+   * runtime.extensions.get('pool').lease() and wraps it. Pool absence
+   * is a hard error when leasedFrom defaults to 'pool'; pass
+   * leasedFrom: 'manual' + sessionId to skip pool.
+   */
+  async lease(opts: LeaseOpts): Promise<Agent> {
+    if (!opts || typeof opts.role !== 'string' || !opts.role.trim()) {
+      throw new Error('agents.lease: opts.role is required');
+    }
+    if (!this.rolesById.has(opts.role)) {
+      throw new Error(
+        `agents.lease: role '${opts.role}' is not registered. Call agents.roles.register first or use one of: ${[...this.rolesById.keys()].join(', ')}`,
+      );
+    }
+    const leasedFrom = opts.leasedFrom ?? 'pool';
+
+    let sessionId: string | null = null;
+    let leaseToken: string | null = null;
+
+    if (leasedFrom === 'pool') {
+      const pool = this.resolvePool();
+      if (!pool) {
+        throw new Error(
+          "agents.lease: leasedFrom='pool' but the pool extension is not available. " +
+            "Either load blur-session-pool, or pass leasedFrom:'manual' with an explicit sessionId.",
+        );
+      }
+      const lease = await pool.lease(opts.pool ?? {});
+      sessionId = lease.sessionId;
+      leaseToken = lease.leaseToken;
+    } else if (leasedFrom === 'external' || leasedFrom === 'manual') {
+      if (typeof opts.sessionId === 'string' && opts.sessionId.length > 0) {
+        sessionId = opts.sessionId;
+      } else {
+        // sessionId may be set later via attachSession (e.g. when the
+        // operator manually binds an already-running Claude Code session).
+        sessionId = null;
+      }
+    }
+
+    const id = `agt_${randomUUID()}`;
+    const now = new Date().toISOString();
+    const bindings: AgentBinding[] = (opts.bindings ?? []).map((b) => ({
+      scope: b.scope,
+      ref: b.ref,
+      note: b.note,
+      attachedAt: now,
+    }));
+    const label = opts.label ?? this.defaultLabel(opts.role, bindings);
+    const notes: AgentNote[] = (opts.notes ?? []).map((n) => ({
+      at: now,
+      kind: n.kind,
+      text: n.text,
+      by: n.by,
+    }));
+
+    const agent: Agent = {
+      id,
+      role: opts.role,
+      label,
+      status: 'active',
+      sessionId,
+      leaseToken,
+      bindings,
+      handoff: opts.handoff ? { ...opts.handoff } : undefined,
+      notes,
+      leasedAt: now,
+      leasedFrom,
+      updatedAt: now,
+    };
+    this.byId.set(id, agent);
+    if (sessionId) this.sessionIndex.set(sessionId, id);
+    this.emit('agents.leased', agent, {
+      role: agent.role,
+      leasedFrom: agent.leasedFrom,
+      sessionId: agent.sessionId,
+      by: opts.by,
+    });
+    return this.snapshot(agent);
+  }
+
+  /**
+   * Release an Agent. By default this releases the underlying pool
+   * session (if any) and marks the agent's status='released'. Record
+   * is preserved for audit. Idempotent for already-released agents.
+   */
+  async release(id: string, opts: ReleaseOpts = {}): Promise<Agent> {
+    const a = this.require(id);
+    if (a.status === 'released') return this.snapshot(a);
+
+    if (opts.reason) {
+      this.addNoteInternal(a, {
+        kind: 'session-swap',
+        text: `release: ${opts.reason}`,
+        by: opts.by ?? a.id,
+      });
+    }
+
+    if (a.leaseToken && !opts.keepSession) {
+      const pool = this.resolvePool();
+      if (pool) {
+        try {
+          await pool.release(a.leaseToken);
+        } catch (e) {
+          // Pool release failure shouldn't strand the agent record.
+          // Emit a note so it's auditable.
+          this.addNoteInternal(a, {
+            kind: 'observation',
+            text: `pool.release failed: ${(e as Error).message}`,
+            by: a.id,
+          });
+        }
+      }
+    }
+    const now = new Date().toISOString();
+    if (a.sessionId) this.sessionIndex.delete(a.sessionId);
+    a.status = 'released';
+    a.sessionId = null;
+    a.leaseToken = null;
+    a.releasedAt = now;
+    a.updatedAt = now;
+    this.emit('agents.released', a, { reason: opts.reason, by: opts.by });
+    return this.snapshot(a);
+  }
+
+  /**
+   * Swap the bridge session for an existing Agent. Use when the pool
+   * recycles or when an operator manually re-binds a fresh session.
+   * Does NOT change agent.id — that's the durability invariant.
+   */
+  attachSession(id: string, sessionId: string, leaseToken?: string | null, by?: string): Agent {
+    const a = this.require(id);
+    if (a.status === 'released') {
+      throw new Error(`agents.attachSession: agent ${id} is released; lease a new one`);
+    }
+    if (typeof sessionId !== 'string' || !sessionId) {
+      throw new Error('agents.attachSession: sessionId required');
+    }
+    const oldSession = a.sessionId;
+    if (a.sessionId === sessionId) return this.snapshot(a);
+    if (a.sessionId) this.sessionIndex.delete(a.sessionId);
+    a.sessionId = sessionId;
+    a.leaseToken = leaseToken ?? a.leaseToken ?? null;
+    a.status = 'active';
+    a.updatedAt = new Date().toISOString();
+    this.sessionIndex.set(sessionId, id);
+    this.addNoteInternal(a, {
+      kind: 'session-swap',
+      text: `session swapped: ${oldSession ?? '<none>'} → ${sessionId}`,
+      by: by ?? a.id,
+    });
+    this.emit('agents.session-swapped', a, { oldSession, newSession: sessionId, by });
+    return this.snapshot(a);
+  }
+
+  /**
+   * Pause an Agent — releases the bridge session but keeps the record
+   * with status='paused'. Use when work is mid-flight and you want to
+   * cold-resume later with attachSession.
+   */
+  async pause(id: string, opts: ReleaseOpts = {}): Promise<Agent> {
+    const a = this.require(id);
+    if (a.status === 'paused' || a.status === 'released') return this.snapshot(a);
+    if (a.leaseToken && !opts.keepSession) {
+      const pool = this.resolvePool();
+      if (pool) {
+        try {
+          await pool.release(a.leaseToken);
+        } catch (e) {
+          this.addNoteInternal(a, {
+            kind: 'observation',
+            text: `pause: pool.release failed: ${(e as Error).message}`,
+            by: a.id,
+          });
+        }
+      }
+    }
+    const now = new Date().toISOString();
+    if (a.sessionId) this.sessionIndex.delete(a.sessionId);
+    a.status = 'paused';
+    a.sessionId = null;
+    a.leaseToken = null;
+    a.updatedAt = now;
+    this.addNoteInternal(a, {
+      kind: 'session-swap',
+      text: `paused${opts.reason ? `: ${opts.reason}` : ''}`,
+      by: opts.by ?? a.id,
+    });
+    this.emit('agents.released', a, { paused: true, reason: opts.reason, by: opts.by });
+    return this.snapshot(a);
+  }
+
+  // ===================================================================
+  // Bindings
+  // ===================================================================
+
+  bind(id: string, opts: BindOpts): Agent {
+    const a = this.require(id);
+    if (a.status === 'released') {
+      throw new Error(`agents.bind: agent ${id} is released`);
+    }
+    if (!opts || !opts.binding || typeof opts.binding.scope !== 'string') {
+      throw new Error('agents.bind: { binding: { scope, ref? } } required');
+    }
+    const now = new Date().toISOString();
+    const binding: AgentBinding = {
+      scope: opts.binding.scope,
+      ref: opts.binding.ref,
+      note: opts.binding.note,
+      attachedAt: now,
+    };
+    // Dedup: replace any existing binding with same scope+ref.
+    a.bindings = a.bindings.filter(
+      (b) => !(b.scope === binding.scope && (b.ref ?? '') === (binding.ref ?? '')),
+    );
+    a.bindings.push(binding);
+    a.updatedAt = now;
+    this.emit('agents.bound', a, { binding, by: opts.by });
+    return this.snapshot(a);
+  }
+
+  unbind(id: string, opts: UnbindOpts): Agent {
+    const a = this.require(id);
+    if (!opts || typeof opts.scope !== 'string') {
+      throw new Error('agents.unbind: { scope, ref? } required');
+    }
+    const before = a.bindings.length;
+    a.bindings = a.bindings.filter(
+      (b) => !(b.scope === opts.scope && (b.ref ?? '') === (opts.ref ?? '')),
+    );
+    if (a.bindings.length !== before) {
+      a.updatedAt = new Date().toISOString();
+      this.emit('agents.unbound', a, { scope: opts.scope, ref: opts.ref, by: opts.by });
+    }
+    return this.snapshot(a);
+  }
+
+  // ===================================================================
+  // Notes
+  // ===================================================================
+
+  addNote(id: string, opts: AddNoteOpts): Agent {
+    const a = this.require(id);
+    if (!opts || typeof opts.kind !== 'string' || typeof opts.text !== 'string') {
+      throw new Error('agents.notes.add: { kind, text } required');
+    }
+    this.addNoteInternal(a, opts);
+    return this.snapshot(a);
+  }
+
+  listNotes(id: string): AgentNote[] {
+    const a = this.require(id);
+    return a.notes.map((n) => ({ ...n }));
+  }
+
+  // ===================================================================
+  // Readers
+  // ===================================================================
+
+  /**
+   * Self-reflection — find the Agent record for the calling session.
+   * Resolves sessionId from `opts.sessionId` if provided, else from
+   * the audit frame's aiSessionId. Returns null if no match.
+   */
+  whoAmI(opts: WhoAmIOpts = {}): Agent | null {
+    const sid = opts.sessionId ?? this.resolveCallerSessionId();
+    if (!sid) return null;
+    const aid = this.sessionIndex.get(sid);
+    if (!aid) return null;
+    const a = this.byId.get(aid);
+    return a ? this.snapshot(a) : null;
+  }
+
+  get(id: string): Agent | null {
+    const a = this.byId.get(id);
+    return a ? this.snapshot(a) : null;
+  }
+
+  /** Find an agent by its current sessionId. */
+  bySession(sessionId: string): Agent | null {
+    if (!sessionId) return null;
+    const aid = this.sessionIndex.get(sessionId);
+    if (!aid) return null;
+    const a = this.byId.get(aid);
+    return a ? this.snapshot(a) : null;
+  }
+
+  list(opts: ListOpts = {}): Agent[] {
+    const statuses: AgentStatus[] | null = opts.status
+      ? Array.isArray(opts.status)
+        ? [...opts.status]
+        : [opts.status]
+      : null;
+    const out: Agent[] = [];
+    for (const a of this.byId.values()) {
+      if (opts.role && a.role !== opts.role) continue;
+      if (statuses && !statuses.includes(a.status)) continue;
+      if (opts.bindingScope || opts.bindingRef || opts.project) {
+        const match = a.bindings.some((b) => {
+          if (opts.bindingScope && b.scope !== opts.bindingScope) return false;
+          if (opts.bindingRef && (b.ref ?? '') !== opts.bindingRef) return false;
+          if (opts.project) {
+            // project match: scope='project' ref===project, OR scope='track'/'arc'/'move'
+            // with ref starting with `${project}/` or matching project on a known path.
+            // Simple convention: project bindings have ref===projectId; track has
+            // 'projectId/trackId'. Match if either case applies.
+            if (b.scope === 'project' && b.ref === opts.project) return true;
+            if (
+              (b.scope === 'track' || b.scope === 'arc' || b.scope === 'move') &&
+              typeof b.ref === 'string' &&
+              (b.ref === opts.project || b.ref.startsWith(opts.project + '/'))
+            )
+              return true;
+            return false;
+          }
+          return true;
+        });
+        if (!match) continue;
+      }
+      if (opts.since && a.leasedAt < opts.since) continue;
+      if (opts.until && a.leasedAt > opts.until) continue;
+      out.push(this.snapshot(a));
+    }
+    out.sort((a, b) => (a.leasedAt < b.leasedAt ? -1 : a.leasedAt > b.leasedAt ? 1 : 0));
+    return out;
+  }
+
+  count(opts: ListOpts = {}): number {
+    return this.list(opts).length;
+  }
+
+  // ===================================================================
+  // Persistable (decision 20)
+  // ===================================================================
+
+  saveJson(): string {
+    const payload: PersistedShape = {
+      agents: Array.from(this.byId.values()),
+      roles: Array.from(this.rolesById.values()),
+    };
+    return JSON.stringify(payload);
+  }
+
+  loadJson(json: string): void {
+    if (!json) {
+      this.byId.clear();
+      this.sessionIndex.clear();
+      this.rolesById.clear();
+      return;
+    }
+    let payload: PersistedShape;
+    try {
+      payload = JSON.parse(json) as PersistedShape;
+    } catch (e) {
+      throw new Error(`agents.loadJson: failed to parse snapshot — ${(e as Error).message}`);
+    }
+    this.byId.clear();
+    this.sessionIndex.clear();
+    this.rolesById.clear();
+    if (Array.isArray(payload.roles)) {
+      for (const r of payload.roles) {
+        if (!r || typeof r.id !== 'string') continue;
+        this.rolesById.set(r.id, r);
+      }
+    }
+    if (Array.isArray(payload.agents)) {
+      for (const a of payload.agents) {
+        if (!a || typeof a.id !== 'string') continue;
+        this.byId.set(a.id, a);
+        if (a.status === 'active' && a.sessionId) {
+          this.sessionIndex.set(a.sessionId, a.id);
+        }
+      }
+    }
+  }
+
+  // ===================================================================
+  // Internal
+  // ===================================================================
+
+  private require(id: string): Agent {
+    const a = this.byId.get(id);
+    if (!a) throw new Error(`agents: no agent with id '${id}'`);
+    return a;
+  }
+
+  private defaultLabel(role: string, bindings: AgentBinding[]): string {
+    const primary = bindings.find((b) => b.ref);
+    return primary ? `${role} on ${primary.scope}:${primary.ref}` : role;
+  }
+
+  private addNoteInternal(a: Agent, n: { kind: string; text: string; by?: string }): void {
+    const note: AgentNote = {
+      at: new Date().toISOString(),
+      kind: n.kind,
+      text: n.text,
+      by: n.by,
+    };
+    a.notes.push(note);
+    a.updatedAt = note.at;
+    this.emit('agents.note-added', a, { kind: note.kind, by: note.by });
+  }
+
+  private resolvePool(): PoolBridge | null {
+    const rt = this.runtime as { extensions?: Map<string, object> } | { extensions?: { get(name: string): unknown } };
+    const exts = (rt as { extensions?: unknown }).extensions;
+    if (!exts) return null;
+    const candidate =
+      typeof (exts as { get?: (k: string) => unknown }).get === 'function'
+        ? (exts as { get: (k: string) => unknown }).get('pool')
+        : null;
+    if (!candidate) return null;
+    const c = candidate as Partial<PoolBridge>;
+    if (typeof c.lease !== 'function' || typeof c.release !== 'function') return null;
+    return c as PoolBridge;
+  }
+
+  private resolveCallerSessionId(): string | null {
+    const frame = this.runtime.audit.currentFrame?.();
+    return frame?.aiSessionId ?? null;
+  }
+
+  private snapshot(a: Agent): Agent {
+    return {
+      ...a,
+      bindings: a.bindings.map((b) => ({ ...b })),
+      notes: a.notes.map((n) => ({ ...n })),
+      handoff: a.handoff ? { ...a.handoff } : undefined,
+    };
+  }
+
+  private emit(kind: SemanticKind, a: Agent, extra: Record<string, unknown> = {}): void {
+    this.runtime.audit.emit({
+      kind,
+      ref: `item:agents[${a.id}]`,
+      data: {
+        agentId: a.id,
+        role: a.role,
+        status: a.status,
+        sessionId: a.sessionId,
+        ...extra,
+      },
+    });
+  }
+
+  private emitEvent(kind: SemanticKind, opts: { ref?: string; data?: Record<string, unknown> }): void {
+    this.runtime.audit.emit({ kind, ref: opts.ref, data: opts.data });
+  }
+}
