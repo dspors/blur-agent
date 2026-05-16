@@ -8,7 +8,7 @@
 
 import type { MethodExposure } from 'blur-ai-runtime';
 
-const SRC = 'blur-agent@0.1.0';
+const SRC = 'blur-agent@0.3.0';
 
 export const exposures: MethodExposure[] = [
   // ===================================================================
@@ -227,16 +227,17 @@ export const exposures: MethodExposure[] = [
     method: 'sendMessage',
     primitivePath: 'agents.sendMessage',
     signature:
-      '(agentId: string, opts: { text: string; attachments?: unknown[]; toolPolicy?: "auto"|"restricted"|"none"; by?: string; forceDuplicate?: boolean; idempotencyKey?: string }): Promise<{ replyHandle: string }>',
+      '(agentId: string, opts: { text: string; attachments?: unknown[]; toolPolicy?: "auto"|"restricted"|"none"; by?: string; forceDuplicate?: boolean; idempotencyKey?: string }): Promise<{ replyHandle: string; turnId?: string }>',
     description:
-      'Fire a message AS the agent and return a replyHandle. Pull-mode: ' +
-      'use agents.getReply(handle) to poll chunks. Dispatch by ' +
+      'Fire a message AS the agent and return a replyHandle (plus turnId when the Turns subsystem is wired). ' +
+      'Pull-mode: use agents.getReply(handle) to poll chunks. Dispatch by ' +
       'agent.provider.kind; bridge agents delegate to ' +
       'runtime.bridge.sessions.requestReply (cowork-web-bridge >=0.3.0). ' +
-      'For non-blocking-poll use cases see agents.sendMessageAndAwait.',
+      'Opens a Turn record (the canonical "what happened" log) and mirrors chunks into it. ' +
+      'For non-blocking-poll use cases see agents.sendMessageAndAwait or the host-side agents.sendText.',
     sideEffect: 'write',
     example:
-      "const { replyHandle } = await runtime.agents.sendMessage(agentId, { text: 'Summarize last 3 commits' });",
+      "const { replyHandle, turnId } = await runtime.agents.sendMessage(agentId, { text: 'Summarize last 3 commits' });",
     source: SRC,
     category: 'primary',
   },
@@ -273,6 +274,109 @@ export const exposures: MethodExposure[] = [
     sideEffect: 'write',
     example:
       "const r = await runtime.agents.sendMessageAndAwait(oversightId, { text: 'Review this Charter change', timeoutMs: 30000 });",
+    source: SRC,
+    category: 'primary',
+  },
+
+  // -------------------------------------------------------------------
+  // Live Reply API — host-side ergonomic wrappers
+  //
+  // NOTE: These return LiveReply objects (closures over the
+  // AgentsSubsystem) that do NOT survive the script.run boundary.
+  // Scripts should continue using the plain-data
+  // sendMessage / getReply pair. Host code (other packs, workspace
+  // tool handlers, MCP integrations) gets the better ergonomics.
+  // -------------------------------------------------------------------
+  {
+    objectPath: 'agents',
+    method: 'sendText',
+    primitivePath: 'agents.sendText',
+    signature:
+      '(agentId: string, textOrOpts: string | { text: string; ...SendMessageOpts }, extra?: Omit<SendMessageOpts, "text">): Promise<LiveReply>',
+    description:
+      'Host-side sugar for sendMessage — returns a LiveReply object with .get() / .pull() / .await() / async iterator. ' +
+      'Accumulates text and toolCalls as chunks arrive. NOT for use across script.run boundaries (closure-bearing).',
+    sideEffect: 'write',
+    example:
+      "const reply = await runtime.agents.sendText(agentId, 'List files');\n" +
+      "while (!reply.finished) process.stdout.write(await reply.get());",
+    source: SRC,
+    category: 'primary',
+  },
+  {
+    objectPath: 'agents',
+    method: 'openReply',
+    primitivePath: 'agents.openReply',
+    signature: '(opts: { replyHandle: string; agentId: string; turnId?: string }): LiveReply',
+    description:
+      'Construct a LiveReply for an existing replyHandle (UI remounts, ' +
+      'queue consumers resuming a known reply, etc.). Host-side only.',
+    sideEffect: 'read',
+    source: SRC,
+    category: 'support',
+  },
+
+  // -------------------------------------------------------------------
+  // Turns subsystem — read-side primitives
+  // -------------------------------------------------------------------
+  {
+    objectPath: 'turns',
+    method: 'get',
+    primitivePath: 'agents.turns.get',
+    signature: '(id: string): Promise<Turn | null>',
+    description:
+      'Return a Turn record by id (cloned). Null if unknown. Turns are the canonical ' +
+      '"what happened" record of a prompt-reply pair — durable beyond the volatile ReplyRecord.',
+    sideEffect: 'read',
+    source: SRC,
+    category: 'primary',
+  },
+  {
+    objectPath: 'turns',
+    method: 'list',
+    primitivePath: 'agents.turns.list',
+    signature:
+      '(opts?: { agentId?: string; status?: "streaming"|"complete"|"error" | Array<"streaming"|"complete"|"error">; referencedBy?: { kind: string; ref: string }; since?: string; until?: string; limit?: number }): Promise<Turn[]>',
+    description:
+      'List Turns with optional filters. referencedBy filters to Turns that ' +
+      'carry a specific inbound reference (e.g. all Turns referenced by an Activity).',
+    sideEffect: 'read',
+    source: SRC,
+    category: 'primary',
+  },
+  {
+    objectPath: 'turns',
+    method: 'count',
+    primitivePath: 'agents.turns.count',
+    signature: '(opts?: ListTurnsOpts): Promise<number>',
+    description: 'Count matching Turns.',
+    sideEffect: 'read',
+    source: SRC,
+    category: 'support',
+  },
+  {
+    objectPath: 'turns',
+    method: 'turnForSession',
+    primitivePath: 'agents.turns.turnForSession',
+    signature: '(sessionId: string): Promise<Turn | null>',
+    description:
+      "Find the currently-streaming Turn for an agent's session, when one is active.",
+    sideEffect: 'read',
+    source: SRC,
+    category: 'support',
+  },
+  {
+    objectPath: 'turns',
+    method: 'addReference',
+    primitivePath: 'agents.turns.addReference',
+    signature:
+      '(opts: { turnId: string; reference: { kind: string; ref: string; position?: number } }): Promise<Turn | null>',
+    description:
+      'Attach an inbound reference to a Turn (Activity, NorthStar, Decision, …). ' +
+      'Idempotent on (kind, ref, position). Emits agents.turn.referenced.',
+    sideEffect: 'write',
+    example:
+      "await runtime.agents.turns.addReference({ turnId: 'tur_...', reference: { kind: 'activity', ref: 'act_qb_general_1', position: 3 } });",
     source: SRC,
     category: 'primary',
   },

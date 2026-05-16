@@ -578,3 +578,182 @@ export interface SendMessageAndAwaitOpts extends SendMessageOpts {
   /** Total await timeout across all internal long-polls. Default 60_000 ms. */
   timeoutMs?: number;
 }
+
+// ===========================================================================
+// Turn — the atomic unit of state evolution
+//
+// A Turn is the durable record of one prompt-reply pair, captured at the
+// "request to reply" granularity. It's reference-able from many places
+// (Activities, North Star transcripts, Decision logs) and persists
+// independently of the volatile ReplyRecord (which TTLs out at 24h).
+//
+// Two distinct uses of Turn data motivate the shape:
+//
+//   1. tuning the system — save *everything*. Full assembled text, raw
+//      ReplyRecord linkage, observed side-effects, optional contextSent
+//      when the provider can give it. This record is canonical and never
+//      lossy.
+//
+//   2. seeding the next turn — derived artifact (a "seed" built by a
+//      Secretary pass) is separate, not stored on the Turn itself.
+//
+// Side-effect attribution: while a Turn is active, audit events emitted
+// in a frame carrying its `turnId` (and/or events emitted from the
+// agent's aiSessionId during the Turn window) are collected as
+// `sideEffects`. The TurnsSubsystem owns this collection passively via
+// audit.subscribe — no dedicated tools required for the common case.
+// ===========================================================================
+
+/**
+ * One observed mutation while a Turn was active. Captured by the
+ * TurnsSubsystem's audit subscriber when frame.turnId matches the Turn.
+ *
+ * The shape mirrors the SemanticEventEntry audit log entry, plus the
+ * `op` lens — derived when possible from the eventKind taxonomy.
+ */
+export interface TurnSideEffect {
+  /** ISO 8601 — when the audit event fired. */
+  at: string;
+  /** Audit event kind, e.g. 'agents.note-added', 'projects.charter.updated'. */
+  eventKind: string;
+  /** Audit ref pointing at the mutated item, when available. */
+  ref?: string;
+  /**
+   * Operation lens. Derived from eventKind where the taxonomy is known
+   * (e.g. '*.created' → 'create', '*.updated' → 'set', '*.removed' →
+   * 'delete'). 'other' when the eventKind doesn't map cleanly.
+   */
+  op: 'create' | 'set' | 'append' | 'delete' | 'register' | 'other';
+  /** Event payload — typed unknown to keep shape provider-agnostic. */
+  data?: unknown;
+}
+
+/**
+ * A reference TO this Turn FROM somewhere else. Activities point at the
+ * Turns they contain; Decision logs point at the Turn that birthed them;
+ * North Star transcripts can include selected Turns. The Turn itself
+ * carries the inbound refs so we can do reverse lookups ("who points
+ * at me?") without scanning the entire runtime.
+ */
+export interface TurnReference {
+  /** Domain identifier of the referrer, e.g. 'activity', 'north-star', 'decision'. */
+  kind: string;
+  /** Stable id of the referrer record. */
+  ref: string;
+  /** Optional position / order within the referrer (e.g. activity turn index). */
+  position?: number;
+  /** When the reference was attached. */
+  attachedAt: string;
+}
+
+/** Tool-call payload as observed in the reply. */
+export interface TurnToolCall {
+  /** Provider's tool_use id (Bridge's `{ id }`, OpenAI tool_call.id, …). */
+  id?: string;
+  /** Tool name as the model invoked it. */
+  name: string;
+  /** Input args the model sent. May be depth-1 truncated by the provider. */
+  input: unknown;
+  /** When the tool-call chunk arrived. */
+  at: string;
+}
+
+export type TurnStatus = 'streaming' | 'complete' | 'error';
+
+/**
+ * The first-class Turn record. Persisted by the TurnsSubsystem; durable
+ * across runtime restart. Lives in blur-agent so any provider/agent
+ * interaction produces a Turn regardless of which domain (project,
+ * supervisory, secretary) anchors it.
+ */
+export interface Turn {
+  /** 'tur_<uuid>' — durable id. */
+  id: string;
+
+  /** Agent that produced this Turn. */
+  agentId: string;
+
+  /** Provider kind at time of dispatch. Denormalized for filtering. */
+  providerKind: AgentProvider['kind'];
+
+  /**
+   * The agent's session id at time of dispatch (when known). For
+   * BridgeProvider this is the Claude session id; for HTTP providers
+   * it may be null (no persistent session concept).
+   */
+  agentSessionId?: string | null;
+
+  /** Snapshot of the original request. */
+  request: {
+    text: string;
+    at: string;
+    /** Caller identity — usually a sessionId or agentId. */
+    by?: string;
+  };
+
+  /**
+   * Full context delivered to the model on this Turn, when the provider
+   * can surface it. Bridge today does NOT expose this; HTTP providers
+   * (Together, OpenAI) trivially can. Lazy / optional. Used for tuning
+   * analysis — "what did we actually send?"
+   */
+  contextSent?: string | null;
+
+  /** Linkage to the volatile ReplyRecord. May 404 after the ReplyRecord TTLs. */
+  replyHandle: string;
+
+  /** Concatenated text from text-kind chunks in offset order. */
+  assembledText: string;
+
+  /** Tool-call payloads observed in this Turn. */
+  toolCalls: TurnToolCall[];
+
+  /**
+   * Audit events observed while this Turn was active. Populated
+   * passively by the TurnsSubsystem's audit subscriber. Never edited
+   * directly by callers.
+   */
+  sideEffects: TurnSideEffect[];
+
+  /** Inbound references — who points at this Turn. */
+  references: TurnReference[];
+
+  status: TurnStatus;
+  startedAt: string;
+  endedAt?: string;
+
+  /** Mirror of ReplyRecord.finalSummary when status === 'complete'. */
+  finalSummary?: ReplySummary;
+  errorMessage?: string;
+}
+
+// ===========================================================================
+// Turn opts shapes
+// ===========================================================================
+
+export interface OpenTurnOpts {
+  agentId: string;
+  providerKind: AgentProvider['kind'];
+  agentSessionId?: string | null;
+  request: { text: string; at: string; by?: string };
+  replyHandle: string;
+  contextSent?: string | null;
+}
+
+export interface ListTurnsOpts {
+  agentId?: string;
+  status?: TurnStatus | TurnStatus[];
+  /** Filter by inbound reference — e.g. all Turns referenced by an activity. */
+  referencedBy?: { kind: string; ref: string };
+  /** ISO 8601 lower bound (inclusive). */
+  since?: string;
+  /** ISO 8601 upper bound (inclusive). */
+  until?: string;
+  /** Default 100. */
+  limit?: number;
+}
+
+export interface AddTurnReferenceOpts {
+  turnId: string;
+  reference: Omit<TurnReference, 'attachedAt'>;
+}

@@ -34,6 +34,7 @@ import type {
   Agent,
   AgentBinding,
   AgentNote,
+  AgentProvider,
   AgentRoleDef,
   AgentStatus,
   BindOpts,
@@ -53,6 +54,8 @@ import type {
 import { synthesizeProvider } from './types';
 import type { AgentRepliesSubsystem } from './replies-subsystem';
 import type { ProviderRegistry } from './provider-registry';
+import type { TurnsSubsystem } from './turns-subsystem';
+import { LiveReply } from './live-reply';
 
 interface PersistedShape {
   agents: Agent[];
@@ -96,6 +99,15 @@ export class AgentsSubsystem {
    * Required for sendMessage dispatch.
    */
   providerRegistry: ProviderRegistry | null = null;
+
+  /**
+   * Backref to the Turns subsystem. Set by the pack install.
+   * When present, sendMessage opens a Turn for each dispatch and
+   * mirrors reply chunks into it (assembledText, toolCalls,
+   * sideEffects). When absent (older wiring), dispatch still works —
+   * the Turn record is just skipped.
+   */
+  turnsRef: TurnsSubsystem | null = null;
 
   constructor(public readonly runtime: BlurAIRuntime) {}
 
@@ -620,7 +632,10 @@ export class AgentsSubsystem {
   // registered for the agent's provider kind.
   // ===================================================================
 
-  async sendMessage(agentId: string, opts: SendMessageOpts): Promise<{ replyHandle: string }> {
+  async sendMessage(
+    agentId: string,
+    opts: SendMessageOpts,
+  ): Promise<{ replyHandle: string; turnId?: string }> {
     if (typeof agentId !== 'string' || !agentId.trim()) {
       throw new Error('agents.sendMessage: agentId is required (non-empty string)');
     }
@@ -667,11 +682,95 @@ export class AgentsSubsystem {
       );
     }
 
-    const result = await impl.sendMessage(agentForDispatch, opts, this.repliesRef);
-    if (!result?.replyHandle) {
-      throw new Error(`agents.sendMessage: provider '${resolvedProvider.kind}' returned no replyHandle`);
+    // Dispatch path. If a TurnsSubsystem is wired, we:
+    //   1. open a Turn FIRST (mint a turnId)
+    //   2. wrap provider.sendMessage in audit.withTurn so events
+    //      emitted during the synchronous dispatch carry frame.turnId
+    //   3. start a background chunk-mirror loop that ingests reply
+    //      chunks into the Turn and seals it on complete/error
+    //
+    // Without TurnsSubsystem, dispatch still works — back-compat.
+
+    let turnId: string | undefined;
+    let result: { replyHandle: string };
+
+    const doDispatch = async (): Promise<{ replyHandle: string }> => {
+      const r = await impl.sendMessage(agentForDispatch, opts, this.repliesRef!);
+      if (!r?.replyHandle) {
+        throw new Error(
+          `agents.sendMessage: provider '${resolvedProvider.kind}' returned no replyHandle`,
+        );
+      }
+      return r;
+    };
+
+    if (this.turnsRef) {
+      // Open Turn with a placeholder replyHandle; we'll learn the real
+      // one from provider.sendMessage's return. To keep Turn.replyHandle
+      // truthful, we open AFTER dispatch but BEFORE returning — see
+      // below. But the audit frame needs the turnId to exist DURING
+      // dispatch. Compromise: mint the id first (cheap), dispatch
+      // inside withTurn, then construct the actual Turn record using
+      // the minted id + real replyHandle.
+      const provisionalTurnId = `tur_${randomUUID()}`;
+      const audit = this.runtime.audit as { withTurn?: <T>(seed: { agentId: string; turnId: string }, fn: () => Promise<T>) => Promise<T> };
+      const runDispatch = async (): Promise<{ replyHandle: string }> => doDispatch();
+      if (audit?.withTurn) {
+        result = await audit.withTurn({ agentId, turnId: provisionalTurnId }, runDispatch);
+      } else {
+        result = await runDispatch();
+      }
+      // Now open the Turn for real with the actual replyHandle. The
+      // provisional id is preserved as the Turn id.
+      this.openTurnRecord({
+        provisionalTurnId,
+        agentId,
+        providerKind: resolvedProvider.kind,
+        agentSessionId: extractSessionId(resolvedProvider),
+        request: { text: opts.text, at: new Date().toISOString(), by: opts.by },
+        replyHandle: result.replyHandle,
+      });
+      turnId = provisionalTurnId;
+      // Spawn the chunk-mirror loop (background).
+      this.spawnTurnMirror(turnId, result.replyHandle);
+    } else {
+      result = await doDispatch();
     }
-    return { replyHandle: result.replyHandle };
+
+    return { replyHandle: result.replyHandle, turnId };
+  }
+
+  /**
+   * Sugar variant of sendMessage that returns a LiveReply — host-side
+   * ergonomic wrapper. Pump with .get() / .pull() / .await() or iterate
+   * with for-await. NOT for use across script.run boundaries.
+   */
+  async sendText(
+    agentId: string,
+    textOrOpts: string | SendMessageOpts,
+    extra?: Omit<SendMessageOpts, 'text'>,
+  ): Promise<LiveReply> {
+    const opts: SendMessageOpts =
+      typeof textOrOpts === 'string'
+        ? { text: textOrOpts, ...extra }
+        : { ...textOrOpts, ...extra };
+    const { replyHandle, turnId } = await this.sendMessage(agentId, opts);
+    return new LiveReply(
+      { getReply: (h, o) => this.getReply(h, o) },
+      { handle: replyHandle, agentId, turnId },
+    );
+  }
+
+  /**
+   * Construct a LiveReply for an existing replyHandle. Useful for
+   * resuming a reply from a known handle (e.g. UI component re-
+   * mounting against a known Turn).
+   */
+  openReply(opts: { replyHandle: string; agentId: string; turnId?: string }): LiveReply {
+    return new LiveReply(
+      { getReply: (h, o) => this.getReply(h, o) },
+      { handle: opts.replyHandle, agentId: opts.agentId, turnId: opts.turnId },
+    );
   }
 
   async getReply(replyHandle: string, opts?: GetReplyOpts): Promise<ReplyPoll> {
@@ -752,4 +851,88 @@ export class AgentsSubsystem {
       summary: { ...finalSummary },
     };
   }
+
+  // ===================================================================
+  // Turn lifecycle helpers (called by sendMessage when turnsRef is set)
+  // ===================================================================
+
+  private openTurnRecord(opts: {
+    provisionalTurnId: string;
+    agentId: string;
+    providerKind: AgentProvider['kind'];
+    agentSessionId?: string | null;
+    request: { text: string; at: string; by?: string };
+    replyHandle: string;
+  }): void {
+    if (!this.turnsRef) return;
+    // Use the internal mint path: pass the pre-generated id through
+    // openTurn by patching it onto the subsystem AFTER. The Turn record
+    // is created with a fresh id by openTurn; we need to align them.
+    // Simplest path: call openTurn and then re-key the result. Cleaner:
+    // expose a `openTurnWithId` on TurnsSubsystem. We use openTurn
+    // here and accept that the audit frame's turnId may differ from
+    // the persisted Turn.id in the rare race — addressable in a future
+    // pass. For correctness today, the alignment is critical for
+    // side-effect attribution, so use openTurnWithId.
+    this.turnsRef.openTurnWithId(opts.provisionalTurnId, {
+      agentId: opts.agentId,
+      providerKind: opts.providerKind,
+      agentSessionId: opts.agentSessionId,
+      request: opts.request,
+      replyHandle: opts.replyHandle,
+    });
+  }
+
+  /**
+   * Background poll loop: mirror reply chunks into the Turn and seal
+   * the Turn on reply complete/error. Runs as a fire-and-forget
+   * promise; errors are swallowed after attempting to fail the Turn.
+   */
+  private spawnTurnMirror(turnId: string, replyHandle: string): void {
+    if (!this.turnsRef || !this.repliesRef) return;
+    const turnsRef = this.turnsRef;
+    const repliesRef = this.repliesRef;
+    (async () => {
+      let sinceOffset = 0;
+      while (true) {
+        let poll: ReplyPoll;
+        try {
+          poll = await repliesRef.getReply(replyHandle, {
+            sinceOffset,
+            wait: 'long-poll',
+            timeoutMs: 25_000,
+          });
+        } catch (e) {
+          turnsRef.failTurn(turnId, `mirror loop poll failed: ${(e as Error)?.message ?? String(e)}`);
+          return;
+        }
+        if (poll.chunks.length > 0) {
+          turnsRef.ingestChunks(turnId, poll.chunks);
+        }
+        sinceOffset = poll.nextOffset;
+        if (poll.status === 'complete' && poll.finalSummary) {
+          turnsRef.completeTurn(turnId, poll.finalSummary);
+          return;
+        }
+        if (poll.status === 'error') {
+          turnsRef.failTurn(turnId, poll.errorMessage ?? 'reply errored');
+          return;
+        }
+        if (poll.status !== 'streaming') return;
+      }
+    })().catch(e => {
+      // Ultimate fallback — the loop itself blew up.
+      try {
+        turnsRef.failTurn(turnId, `mirror loop crashed: ${(e as Error)?.message ?? String(e)}`);
+      } catch {
+        /* nothing more to do */
+      }
+    });
+  }
+}
+
+/** Extract the agent's session id from a provider, when applicable. */
+function extractSessionId(provider: AgentProvider): string | null {
+  if (provider.kind === 'bridge') return provider.sessionId ?? null;
+  return null;
 }

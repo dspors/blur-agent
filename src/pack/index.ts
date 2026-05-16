@@ -26,6 +26,7 @@ import type { LibraryPack, LibraryPackInstall, BlurAIRuntime } from 'blur-ai-run
 
 import { AgentsSubsystem } from './agents-subsystem';
 import { AgentRepliesSubsystem } from './replies-subsystem';
+import { TurnsSubsystem } from './turns-subsystem';
 import { ProviderRegistry } from './provider-registry';
 import { bridgeProviderImpl } from './providers/bridge-provider';
 import { mockProviderImpl } from './providers/mock-provider';
@@ -33,9 +34,13 @@ import { exposures } from './exposures';
 
 export { AgentsSubsystem } from './agents-subsystem';
 export { AgentRepliesSubsystem } from './replies-subsystem';
+export { TurnsSubsystem } from './turns-subsystem';
 export { ProviderRegistry } from './provider-registry';
+export { LiveReply } from './live-reply';
 export type { ProviderImpl, ProviderInfo, ProviderCapabilities, AgentRepliesSink } from './provider-registry';
 export type {
+  AddNoteOpts,
+  AddTurnReferenceOpts,
   Agent,
   AgentBinding,
   AgentBindingScope,
@@ -46,15 +51,16 @@ export type {
   AgentProvider,
   AgentRoleDef,
   AgentStatus,
-  AddNoteOpts,
   BindOpts,
   BridgeProvider,
   GetReplyOpts,
   LeaseOpts,
   ListOpts,
+  ListTurnsOpts,
   LocalProvider,
   MockProvider,
   OpenAIProvider,
+  OpenTurnOpts,
   RegisterRoleOpts,
   ReleaseOpts,
   Reply,
@@ -66,6 +72,11 @@ export type {
   SendMessageAndAwaitOpts,
   SendMessageOpts,
   TogetherProvider,
+  Turn,
+  TurnReference,
+  TurnSideEffect,
+  TurnStatus,
+  TurnToolCall,
   UnbindOpts,
   UnregisterRoleOpts,
   WhoAmIOpts,
@@ -116,18 +127,20 @@ const SEEDED_ROLES = [
 
 const pack: LibraryPack = {
   id: 'blur-agent',
-  version: '0.2.0',
+  version: '0.3.0',
 
   install(runtime: BlurAIRuntime): LibraryPackInstall {
     const agents = new AgentsSubsystem(runtime);
     const replies = new AgentRepliesSubsystem(runtime);
+    const turns = new TurnsSubsystem(runtime);
     const providers = new ProviderRegistry();
 
     // Wire the backrefs on the agents subsystem so the dispatch
-    // methods (sendMessage / getReply / sendMessageAndAwait) can
-    // resolve their dependencies without circular imports.
+    // methods (sendMessage / sendText / getReply / sendMessageAndAwait)
+    // can resolve their dependencies without circular imports.
     agents.repliesRef = replies;
     agents.providerRegistry = providers;
+    agents.turnsRef = turns;
 
     // Register built-in providers. mock is fully functional; bridge
     // requires the cowork-web-bridge runtime-pack to be loaded for
@@ -145,11 +158,13 @@ const pack: LibraryPack = {
       }
     }
 
-    // Start TTL sweep on the replies subsystem.
+    // Start TTL sweep on the replies subsystem and audit-subscribe on
+    // the turns subsystem (for side-effect collection).
     replies.start();
+    turns.start();
 
     return {
-      objects: { agents, replies, providers },
+      objects: { agents, replies, turns, providers },
       exposures: [
         ...exposures,
         // Per-provider exposures (Decision 29 escape-hatch pattern).
