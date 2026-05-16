@@ -1,0 +1,152 @@
+/**
+ * Scheduler exposures.
+ *
+ * Mounted at `runtime.scheduler.*`. The Scheduler is the central queue
+ * for all work that needs an Agent. Priority differentiates UI-driven
+ * (high) from background AI-only (low); the mechanism is one primitive.
+ */
+
+import type { MethodExposure } from 'blur-ai-runtime';
+
+const SRC = 'blur-agent@0.3.0';
+
+export const schedulerExposures: MethodExposure[] = [
+  // ===================================================================
+  // Submit + lifecycle
+  // ===================================================================
+  {
+    objectPath: 'scheduler',
+    method: 'submit',
+    primitivePath: 'agents.scheduler.submit',
+    signature:
+      "(opts: { workRef: { kind: string; ref: string }; priority?: number; submittedBy: string; preferredAgentId?: string; preferredProviderKind?: 'bridge'|'together'|'openai'|'local'|'mock'; requiredRole?: string; requiredCapabilities?: { vision?: boolean; toolUse?: 'native'|'unsupported'|'limited' }; contextScope?: { projectId?: string; engagementId?: string; activityKind?: string } }): WorkItem",
+    description:
+      'Submit a WorkItem to the scheduler. Default priority=50. The scheduler ' +
+      'immediately attempts assignment; if no eligible idle agent, the item ' +
+      'waits in the queue and is reconsidered on the next tick (5s) or when ' +
+      'an agent completes existing work. Emits agents.scheduler.work-submitted ' +
+      'plus agents.scheduler.work-assigned if assignment succeeded.',
+    sideEffect: 'write',
+    example:
+      "await runtime.scheduler.submit({ workRef: { kind: 'engagement', ref: 'eng_…' }, priority: 100, submittedBy: 'user', requiredRole: 'configuration', contextScope: { projectId: 'qb', engagementId: 'eng_…', activityKind: 'general' } });",
+    source: SRC,
+    category: 'primary',
+  },
+  {
+    objectPath: 'scheduler',
+    method: 'reportStarted',
+    primitivePath: 'agents.scheduler.reportStarted',
+    signature: '(workItemId: string): WorkItem',
+    description:
+      'Consumer reports work has actually begun (post-assignment). Flips status assigned → running. Emits agents.scheduler.work-started.',
+    sideEffect: 'write',
+    source: SRC,
+    category: 'primary',
+  },
+  {
+    objectPath: 'scheduler',
+    method: 'reportCompleted',
+    primitivePath: 'agents.scheduler.reportCompleted',
+    signature: '(workItemId: string): WorkItem',
+    description:
+      'Consumer reports work finished successfully. Frees the agent and triggers a re-scan of the queue.',
+    sideEffect: 'write',
+    source: SRC,
+    category: 'primary',
+  },
+  {
+    objectPath: 'scheduler',
+    method: 'reportFailed',
+    primitivePath: 'agents.scheduler.reportFailed',
+    signature: '(workItemId: string, errorMessage: string): WorkItem',
+    description: 'Consumer reports work failed. Frees the agent and triggers a re-scan.',
+    sideEffect: 'write',
+    source: SRC,
+    category: 'primary',
+  },
+  {
+    objectPath: 'scheduler',
+    method: 'cancel',
+    primitivePath: 'agents.scheduler.cancel',
+    signature: '(workItemId: string, reason?: string): WorkItem',
+    description: 'Cancel a queued or in-flight WorkItem.',
+    sideEffect: 'write',
+    source: SRC,
+    category: 'primary',
+  },
+
+  // ===================================================================
+  // Reads
+  // ===================================================================
+  {
+    objectPath: 'scheduler',
+    method: 'get',
+    primitivePath: 'agents.scheduler.get',
+    signature: '(workItemId: string): WorkItem | null',
+    description: 'Return a WorkItem by id (cloned). Null if unknown.',
+    sideEffect: 'read',
+    source: SRC,
+    category: 'primary',
+  },
+  {
+    objectPath: 'scheduler',
+    method: 'list',
+    primitivePath: 'agents.scheduler.list',
+    signature:
+      "(opts?: { status?: 'queued'|'assigned'|'running'|'completed'|'failed'|'cancelled' | Array<...>; workRefKind?: string; workRefRef?: string; assignedAgentId?: string; limit?: number }): WorkItem[]",
+    description: 'List WorkItems with optional filters. Priority-desc then submittedAt-asc order.',
+    sideEffect: 'read',
+    source: SRC,
+    category: 'primary',
+  },
+  {
+    objectPath: 'scheduler',
+    method: 'count',
+    primitivePath: 'agents.scheduler.count',
+    signature: '(opts?: ListWorkItemsOpts): number',
+    description: 'Count WorkItems.',
+    sideEffect: 'read',
+    source: SRC,
+    category: 'support',
+  },
+
+  // ===================================================================
+  // Routing policy
+  // ===================================================================
+  {
+    objectPath: 'scheduler',
+    method: 'setRoutingPolicy',
+    primitivePath: 'agents.scheduler.routing.set',
+    signature:
+      "(opts: { entry: { kind: string; defaultProviderKind?: 'bridge'|'together'|'openai'|'local'|'mock'; sticky?: boolean; fallbackProviderKind?: 'bridge'|'together'|'openai'|'local'|'mock'; hints?: Record<string, unknown> }; by?: string }): RoutingPolicyEntry",
+    description:
+      'Set the routing policy for an activity kind. Tells the scheduler which provider ' +
+      'to prefer when no preferredAgentId / preferredProviderKind is on the WorkItem. ' +
+      'Emits agents.scheduler.routing-policy-set.',
+    sideEffect: 'write',
+    example:
+      "await runtime.scheduler.setRoutingPolicy({ entry: { kind: 'secretary-pass', defaultProviderKind: 'together' } });",
+    source: SRC,
+    category: 'primary',
+  },
+  {
+    objectPath: 'scheduler',
+    method: 'getRoutingPolicy',
+    primitivePath: 'agents.scheduler.routing.get',
+    signature: '(kind: string): RoutingPolicyEntry | null',
+    description: 'Look up a routing policy entry by activity kind.',
+    sideEffect: 'read',
+    source: SRC,
+    category: 'support',
+  },
+  {
+    objectPath: 'scheduler',
+    method: 'listRoutingPolicy',
+    primitivePath: 'agents.scheduler.routing.list',
+    signature: '(): RoutingPolicyEntry[]',
+    description: 'List all routing policy entries.',
+    sideEffect: 'read',
+    source: SRC,
+    category: 'support',
+  },
+];

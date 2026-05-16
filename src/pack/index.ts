@@ -27,16 +27,30 @@ import type { LibraryPack, LibraryPackInstall, BlurAIRuntime } from 'blur-ai-run
 import { AgentsSubsystem } from './agents-subsystem';
 import { AgentRepliesSubsystem } from './replies-subsystem';
 import { TurnsSubsystem } from './turns-subsystem';
+import { SchedulerSubsystem } from './scheduler-subsystem';
 import { ProviderRegistry } from './provider-registry';
 import { bridgeProviderImpl } from './providers/bridge-provider';
 import { mockProviderImpl } from './providers/mock-provider';
 import { exposures } from './exposures';
+import { schedulerExposures } from './scheduler-exposures';
 
 export { AgentsSubsystem } from './agents-subsystem';
 export { AgentRepliesSubsystem } from './replies-subsystem';
 export { TurnsSubsystem } from './turns-subsystem';
+export { SchedulerSubsystem } from './scheduler-subsystem';
 export { ProviderRegistry } from './provider-registry';
 export { LiveReply } from './live-reply';
+export type {
+  AssignmentResult,
+  ListWorkItemsOpts,
+  RoutingPolicyEntry,
+  SetRoutingPolicyOpts,
+  SubmitWorkItemOpts,
+  WorkItem,
+  WorkItemRef,
+  WorkItemStatus,
+} from './scheduler-types';
+export type { SchedulerAlgorithm } from './scheduler-subsystem';
 export type { ProviderImpl, ProviderInfo, ProviderCapabilities, AgentRepliesSink } from './provider-registry';
 export type {
   AddNoteOpts,
@@ -127,12 +141,13 @@ const SEEDED_ROLES = [
 
 const pack: LibraryPack = {
   id: 'blur-agent',
-  version: '0.3.0',
+  version: '0.4.0',
 
   install(runtime: BlurAIRuntime): LibraryPackInstall {
     const agents = new AgentsSubsystem(runtime);
     const replies = new AgentRepliesSubsystem(runtime);
     const turns = new TurnsSubsystem(runtime);
+    const scheduler = new SchedulerSubsystem(runtime);
     const providers = new ProviderRegistry();
 
     // Wire the backrefs on the agents subsystem so the dispatch
@@ -141,6 +156,9 @@ const pack: LibraryPack = {
     agents.repliesRef = replies;
     agents.providerRegistry = providers;
     agents.turnsRef = turns;
+
+    // Scheduler reaches into agents for candidate listing.
+    scheduler.agentsRef = agents;
 
     // Register built-in providers. mock is fully functional; bridge
     // requires the cowork-web-bridge runtime-pack to be loaded for
@@ -158,15 +176,34 @@ const pack: LibraryPack = {
       }
     }
 
-    // Start TTL sweep on the replies subsystem and audit-subscribe on
-    // the turns subsystem (for side-effect collection).
+    // Seed routing policy. Aligns with the engagement-kind catalog
+    // seeded by blur-project. Idempotent (last-set wins).
+    const SEEDED_ROUTING = [
+      { kind: 'general', defaultProviderKind: 'bridge' as const, sticky: true },
+      { kind: 'project-interview', defaultProviderKind: 'bridge' as const, sticky: true },
+      { kind: 'coding', defaultProviderKind: 'bridge' as const, sticky: true },
+      { kind: 'secretary-pass', defaultProviderKind: 'together' as const, sticky: false },
+      { kind: 'secretary-seed-build', defaultProviderKind: 'together' as const },
+      { kind: 'supervisory-review', defaultProviderKind: 'bridge' as const },
+    ];
+    for (const entry of SEEDED_ROUTING) {
+      try {
+        scheduler.setRoutingPolicy({ entry, by: 'blur-agent@install' });
+      } catch {
+        /* swallow */
+      }
+    }
+
+    // Start TTL sweep on replies, audit-subscribe on turns, tick on scheduler.
     replies.start();
     turns.start();
+    scheduler.start();
 
     return {
-      objects: { agents, replies, turns, providers },
+      objects: { agents, replies, turns, scheduler, providers },
       exposures: [
         ...exposures,
+        ...schedulerExposures,
         // Per-provider exposures (Decision 29 escape-hatch pattern).
         // Mounted under runtime.agents.providers.<kind>.*. Today none
         // of the built-in providers ship custom exposures; this picks

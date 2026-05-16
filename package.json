@@ -1,7 +1,7 @@
 {
   "name": "blur-agent",
-  "version": "0.3.0",
-  "description": "Agent subsystem for blur-ai-runtime — durable AI-session identity + Turn record + live Reply API. Wraps pool.lease() to give every project-attached AI session a typed Agent record. sendMessage opens a Turn record (canonical 'what happened' log), mirrors reply chunks into it, collects side-effects via audit subscription. sendText returns a LiveReply for host-side ergonomics.",
+  "version": "0.4.0",
+  "description": "Agent subsystem for blur-ai-runtime — durable AI-session identity + Turn record + live Reply API + Scheduler (central work queue with routing policy). sendMessage opens a Turn record (canonical 'what happened' log) and mirrors reply chunks into it. sendText returns a LiveReply for host-side ergonomics. The Scheduler is the central queue for all agent work — priority differentiates UI-driven from background AI-only.",
   "license": "UNLICENSED",
   "private": true,
   "main": "dist/pack/index.js",
