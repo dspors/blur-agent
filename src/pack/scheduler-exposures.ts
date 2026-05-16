@@ -149,4 +149,31 @@ export const schedulerExposures: MethodExposure[] = [
     source: SRC,
     category: 'support',
   },
+
+  // ===================================================================
+  // AI optimizer (observation-v0)
+  // ===================================================================
+  {
+    objectPath: 'scheduler',
+    method: 'useAIOptimizer',
+    primitivePath: 'agents.scheduler.useAIOptimizer',
+    signature:
+      "(opts?: { consultPriorityCeiling?: number; skipActivityKinds?: string[]; consultTimeoutMs?: number; schedulerAgentId?: string; disable?: boolean }): SchedulerAlgorithm",
+    description:
+      'Wrap the current algorithm in an AI-augmented version that consults ' +
+      'a leased Scheduler agent for review of each decision. Observation-' +
+      'only in v0 — never overrides the deterministic decision. Verdicts ' +
+      'fire as audit events (kind: agents.scheduler.ai-verdict). Default ' +
+      "skips priority >= 90 (UI-driven) and activityKind 'scheduler-tick' " +
+      '(recursion). Pass `disable: true` to revert to the deterministic ' +
+      'algorithm.',
+    sideEffect: 'write',
+    example:
+      "// Enable AI oversight on the scheduler:\n" +
+      "await runtime.agents.lease({ role: 'scheduler', label: 'live scheduler agent', leasedFrom: 'manual', sessionId: '...', provider: { kind: 'together', model: '...' } });\n" +
+      "await runtime.scheduler.useAIOptimizer({ consultTimeoutMs: 8000 });\n" +
+      "// Now every below-priority-90 assignment fires an async consultation.",
+    source: SRC,
+    category: 'support',
+  },
 ];

@@ -51,6 +51,8 @@ export type {
   WorkItemStatus,
 } from './scheduler-types';
 export type { SchedulerAlgorithm } from './scheduler-subsystem';
+export { aiSchedulerAlgorithm } from './ai-scheduler';
+export type { AIAlgorithmOpts, AIVerdict, AIVerdictRecord } from './ai-scheduler';
 export type { ProviderImpl, ProviderInfo, ProviderCapabilities, AgentRepliesSink } from './provider-registry';
 export type {
   AddNoteOpts,

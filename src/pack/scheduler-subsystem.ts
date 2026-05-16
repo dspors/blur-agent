@@ -115,6 +115,40 @@ export class SchedulerSubsystem implements Persistable {
     this.algorithm = algorithm;
   }
 
+  /** Read-only access to the current algorithm (used by the AI wrapper). */
+  getAlgorithm(): SchedulerAlgorithm {
+    return this.algorithm;
+  }
+
+  /**
+   * Convenience: wrap the current algorithm in an AI-augmented version
+   * that consults a leased Scheduler agent for review of each decision.
+   * Observation-only — never overrides the deterministic decision.
+   *
+   * Requires the agents subsystem to be wired (it is, by pack install).
+   * Pass `disable: true` to revert to the base algorithm; this restores
+   * a fresh `defaultAlgorithm()` unless you previously stashed your own.
+   *
+   * See ai-scheduler.ts for the full design rationale and v1+ direction.
+   */
+  useAIOptimizer(
+    opts?: import('./ai-scheduler').AIAlgorithmOpts & { disable?: boolean },
+  ): SchedulerAlgorithm {
+    if (opts?.disable) {
+      this.algorithm = defaultAlgorithm();
+      return this.algorithm;
+    }
+    if (!this.agentsRef) {
+      throw new Error('scheduler.useAIOptimizer: agentsRef not wired');
+    }
+    // Lazy import — avoid a hard dependency from the subsystem on the
+    // wrapper module so tree-shakers can drop it when unused.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { aiSchedulerAlgorithm } = require('./ai-scheduler') as typeof import('./ai-scheduler');
+    this.algorithm = aiSchedulerAlgorithm(this.algorithm, this.agentsRef, this.runtime, opts);
+    return this.algorithm;
+  }
+
   // ===================================================================
   // Submit
   // ===================================================================
