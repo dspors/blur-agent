@@ -137,6 +137,32 @@ const SEEDED_ROLES = [
       'Risk-watcher. Reads project + track state, raises Risks on the Charter, files high-severity Tickets when warranted. Read-mostly; does not execute Moves.',
     defaultBindingScopes: ['project' as const, 'track' as const],
   },
+  {
+    id: 'secretary',
+    label: 'Secretary Agent',
+    description:
+      "Background extractor / organizer. Reads completed Engagements (and " +
+      "their Turn histories) and writes structured outputs into project " +
+      "metadata / North Star transcripts / Decision logs. Designed for " +
+      "cheap providers (together.ai by default) — narrow, mechanical sorting " +
+      "work, not interpretation. Many parallel secretary passes can run " +
+      "concurrently.",
+    defaultBindingScopes: ['project' as const, 'cross-project' as const],
+    defaultHandoffCwdTemplate: '~/.blur/blur-project-management/{projectId}/handoffs/secretary/',
+  },
+  {
+    id: 'scheduler',
+    label: 'Scheduler Agent',
+    description:
+      "Resource optimizer for the WorkItem queue. Watches assignments, " +
+      "agent utilization, and recent outcomes; nudges assignment decisions " +
+      "as oversight on top of the deterministic algorithm. v0 is lightweight " +
+      "(periodic review of the queue, propose rebalances). Forward direction: " +
+      "tuning loop that learns which provider works best for which Activity, " +
+      "dynamically adjusts routing policy, surfaces capacity issues.",
+    defaultBindingScopes: ['runtime' as const, 'cross-project' as const],
+    defaultHandoffCwdTemplate: '~/.blur/blur-project-management/handoffs/scheduler/',
+  },
 ];
 
 const pack: LibraryPack = {
@@ -176,8 +202,9 @@ const pack: LibraryPack = {
       }
     }
 
-    // Seed routing policy. Aligns with the engagement-kind catalog
-    // seeded by blur-project. Idempotent (last-set wins).
+    // Seed routing policy. Aligns with the Activity catalog seeded by
+    // blur-project. Idempotent (last-set wins). Each `kind` here
+    // corresponds to an Activity.id.
     const SEEDED_ROUTING = [
       { kind: 'general', defaultProviderKind: 'bridge' as const, sticky: true },
       { kind: 'project-interview', defaultProviderKind: 'bridge' as const, sticky: true },
@@ -185,6 +212,10 @@ const pack: LibraryPack = {
       { kind: 'secretary-pass', defaultProviderKind: 'together' as const, sticky: false },
       { kind: 'secretary-seed-build', defaultProviderKind: 'together' as const },
       { kind: 'supervisory-review', defaultProviderKind: 'bridge' as const },
+      // Scheduler-tick is itself an AI pass over the queue. Cheap by
+      // design — runs frequently as an oversight loop on top of the
+      // deterministic algorithm.
+      { kind: 'scheduler-tick', defaultProviderKind: 'together' as const, sticky: false },
     ];
     for (const entry of SEEDED_ROUTING) {
       try {
