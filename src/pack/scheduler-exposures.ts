@@ -8,7 +8,6 @@
 
 import type { MethodExposure } from 'blur-ai-runtime';
 
-const SRC = 'blur-agent@0.3.0';
 
 export const schedulerExposures: MethodExposure[] = [
   // ===================================================================
@@ -29,7 +28,6 @@ export const schedulerExposures: MethodExposure[] = [
     sideEffect: 'write',
     example:
       "await runtime.scheduler.submit({ workRef: { kind: 'engagement', ref: 'eng_…' }, priority: 100, submittedBy: 'user', requiredRole: 'configuration', contextScope: { projectId: 'qb', engagementId: 'eng_…', activityKind: 'general' } });",
-    source: SRC,
     category: 'primary',
   },
   {
@@ -40,7 +38,6 @@ export const schedulerExposures: MethodExposure[] = [
     description:
       'Consumer reports work has actually begun (post-assignment). Flips status assigned → running. Emits agents.scheduler.work-started.',
     sideEffect: 'write',
-    source: SRC,
     category: 'primary',
   },
   {
@@ -51,7 +48,6 @@ export const schedulerExposures: MethodExposure[] = [
     description:
       'Consumer reports work finished successfully. Frees the agent and triggers a re-scan of the queue.',
     sideEffect: 'write',
-    source: SRC,
     category: 'primary',
   },
   {
@@ -61,7 +57,6 @@ export const schedulerExposures: MethodExposure[] = [
     signature: '(workItemId: string, errorMessage: string): WorkItem',
     description: 'Consumer reports work failed. Frees the agent and triggers a re-scan.',
     sideEffect: 'write',
-    source: SRC,
     category: 'primary',
   },
   {
@@ -71,7 +66,6 @@ export const schedulerExposures: MethodExposure[] = [
     signature: '(workItemId: string, reason?: string): WorkItem',
     description: 'Cancel a queued or in-flight WorkItem.',
     sideEffect: 'write',
-    source: SRC,
     category: 'primary',
   },
 
@@ -85,7 +79,6 @@ export const schedulerExposures: MethodExposure[] = [
     signature: '(workItemId: string): WorkItem | null',
     description: 'Return a WorkItem by id (cloned). Null if unknown.',
     sideEffect: 'read',
-    source: SRC,
     category: 'primary',
   },
   {
@@ -96,7 +89,6 @@ export const schedulerExposures: MethodExposure[] = [
       "(opts?: { status?: 'queued'|'assigned'|'running'|'completed'|'failed'|'cancelled' | Array<...>; workRefKind?: string; workRefRef?: string; assignedAgentId?: string; limit?: number }): WorkItem[]",
     description: 'List WorkItems with optional filters. Priority-desc then submittedAt-asc order.',
     sideEffect: 'read',
-    source: SRC,
     category: 'primary',
   },
   {
@@ -106,7 +98,6 @@ export const schedulerExposures: MethodExposure[] = [
     signature: '(opts?: ListWorkItemsOpts): number',
     description: 'Count WorkItems.',
     sideEffect: 'read',
-    source: SRC,
     category: 'support',
   },
 
@@ -126,7 +117,6 @@ export const schedulerExposures: MethodExposure[] = [
     sideEffect: 'write',
     example:
       "await runtime.scheduler.setRoutingPolicy({ entry: { kind: 'secretary-pass', defaultProviderKind: 'together' } });",
-    source: SRC,
     category: 'primary',
   },
   {
@@ -136,7 +126,6 @@ export const schedulerExposures: MethodExposure[] = [
     signature: '(kind: string): RoutingPolicyEntry | null',
     description: 'Look up a routing policy entry by activity kind.',
     sideEffect: 'read',
-    source: SRC,
     category: 'support',
   },
   {
@@ -146,7 +135,6 @@ export const schedulerExposures: MethodExposure[] = [
     signature: '(): RoutingPolicyEntry[]',
     description: 'List all routing policy entries.',
     sideEffect: 'read',
-    source: SRC,
     category: 'support',
   },
 
@@ -173,7 +161,6 @@ export const schedulerExposures: MethodExposure[] = [
       "await runtime.agents.lease({ role: 'scheduler', label: 'live scheduler agent', leasedFrom: 'manual', sessionId: '...', provider: { kind: 'together', model: '...' } });\n" +
       "await runtime.scheduler.useAIOptimizer({ consultTimeoutMs: 8000 });\n" +
       "// Now every below-priority-90 assignment fires an async consultation.",
-    source: SRC,
     category: 'support',
   },
 ];

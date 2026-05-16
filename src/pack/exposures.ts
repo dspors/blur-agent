@@ -8,7 +8,6 @@
 
 import type { MethodExposure } from 'blur-ai-runtime';
 
-const SRC = 'blur-agent@0.3.0';
 
 export const exposures: MethodExposure[] = [
   // ===================================================================
@@ -25,7 +24,6 @@ export const exposures: MethodExposure[] = [
     sideEffect: 'write',
     example:
       "await runtime.agents.lease({ role: 'conductor', label: 'qb Conductor', bindings: [{ scope: 'project', ref: 'qb' }], handoff: { cwd: 'C:\\\\Users\\\\dspors\\\\.blur\\\\projects\\\\qb\\\\handoffs\\\\conductor' } });",
-    source: SRC,
     category: 'primary',
   },
   {
@@ -36,7 +34,6 @@ export const exposures: MethodExposure[] = [
     description:
       "Release an Agent. Releases the underlying pool session (unless keepSession) and marks status='released'. Record is preserved. Emits agents.released.",
     sideEffect: 'write',
-    source: SRC,
     category: 'primary',
   },
   {
@@ -47,7 +44,6 @@ export const exposures: MethodExposure[] = [
     description:
       "Pause an Agent — releases the bridge session, keeps the record at status='paused'. Use when work is mid-flight and you want to cold-resume later via attachSession. Emits agents.released (with paused:true in data).",
     sideEffect: 'write',
-    source: SRC,
     category: 'primary',
   },
   {
@@ -58,7 +54,6 @@ export const exposures: MethodExposure[] = [
     description:
       'Swap the bridge session for an existing Agent (rotation, manual re-bind). Does NOT change agent.id — that is the durability invariant. Emits agents.session-swapped.',
     sideEffect: 'write',
-    source: SRC,
     category: 'primary',
   },
 
@@ -74,7 +69,6 @@ export const exposures: MethodExposure[] = [
     description:
       'Attach a scope binding to an Agent. Idempotent on (scope, ref) — re-binding the same target replaces. Emits agents.bound.',
     sideEffect: 'write',
-    source: SRC,
     category: 'primary',
   },
   {
@@ -84,7 +78,6 @@ export const exposures: MethodExposure[] = [
     signature: "(id: string, opts: { scope: 'cross-project'|'project'|'track'|'arc'|'move'|'pack'|'runtime'; ref?: string; by?: string }): Agent",
     description: 'Detach a scope binding. Emits agents.unbound if a binding was removed.',
     sideEffect: 'write',
-    source: SRC,
     category: 'primary',
   },
 
@@ -100,7 +93,6 @@ export const exposures: MethodExposure[] = [
       "Self-reflection — returns the Agent for the calling session. By default resolves the caller's session via the audit frame's aiSessionId; override with opts.sessionId for testing or to introspect another agent. Returns null when no Agent matches.",
     sideEffect: 'read',
     example: 'const me = await runtime.agents.whoAmI(); // → my role, bindings, handoff, notes',
-    source: SRC,
     category: 'primary',
   },
 
@@ -115,7 +107,6 @@ export const exposures: MethodExposure[] = [
     description:
       'Append a structured note to an Agent. Used for handoff summaries, self-assessments, observations the next agent should see. Emits agents.note-added.',
     sideEffect: 'write',
-    source: SRC,
     category: 'primary',
   },
   {
@@ -125,7 +116,6 @@ export const exposures: MethodExposure[] = [
     signature: '(id: string): AgentNote[]',
     description: 'List all notes on an Agent in append order.',
     sideEffect: 'read',
-    source: SRC,
     category: 'primary',
   },
 
@@ -139,7 +129,6 @@ export const exposures: MethodExposure[] = [
     signature: '(id: string): Agent | null',
     description: 'Return one Agent by id. Null if not found.',
     sideEffect: 'read',
-    source: SRC,
     category: 'primary',
   },
   {
@@ -149,7 +138,6 @@ export const exposures: MethodExposure[] = [
     signature: '(sessionId: string): Agent | null',
     description: 'Find the Agent currently inhabiting a given bridge sessionId.',
     sideEffect: 'read',
-    source: SRC,
     category: 'primary',
   },
   {
@@ -160,7 +148,6 @@ export const exposures: MethodExposure[] = [
       "(opts?: { role?: string; status?: 'active'|'paused'|'released' | Array<'active'|'paused'|'released'>; bindingScope?: 'cross-project'|'project'|'track'|'arc'|'move'|'pack'|'runtime'; bindingRef?: string; project?: string; since?: string; until?: string }): Agent[]",
     description: 'List Agents with optional filters. project shorthand matches any binding whose ref starts with that projectId.',
     sideEffect: 'read',
-    source: SRC,
     category: 'primary',
   },
   {
@@ -170,7 +157,6 @@ export const exposures: MethodExposure[] = [
     signature: '(opts?: ListOpts): number',
     description: 'Count matching agents.',
     sideEffect: 'read',
-    source: SRC,
     category: 'support',
   },
 
@@ -185,7 +171,6 @@ export const exposures: MethodExposure[] = [
       "(opts: { role: { id: string; label: string; description: string; defaultBindingScopes?: Array<'cross-project'|'project'|'track'|'arc'|'move'|'pack'|'runtime'>; defaultHandoffCwdTemplate?: string; docs?: string }; by?: string }): AgentRoleDef",
     description: 'Register a new Agent role in the open catalog. Emits agents.role-registered.',
     sideEffect: 'write',
-    source: SRC,
     category: 'primary',
   },
   {
@@ -195,7 +180,6 @@ export const exposures: MethodExposure[] = [
     signature: '(opts: { id: string; by?: string }): boolean',
     description: 'Unregister a role from the catalog. Returns true if it existed. Emits agents.role-unregistered.',
     sideEffect: 'write',
-    source: SRC,
     category: 'support',
   },
   {
@@ -205,7 +189,6 @@ export const exposures: MethodExposure[] = [
     signature: '(): AgentRoleDef[]',
     description: 'List all registered roles.',
     sideEffect: 'read',
-    source: SRC,
     category: 'primary',
   },
   {
@@ -215,7 +198,6 @@ export const exposures: MethodExposure[] = [
     signature: '(id: string): AgentRoleDef | null',
     description: 'Look up one role by id.',
     sideEffect: 'read',
-    source: SRC,
     category: 'support',
   },
 
@@ -238,7 +220,6 @@ export const exposures: MethodExposure[] = [
     sideEffect: 'write',
     example:
       "const { replyHandle, turnId } = await runtime.agents.sendMessage(agentId, { text: 'Summarize last 3 commits' });",
-    source: SRC,
     category: 'primary',
   },
   {
@@ -256,7 +237,6 @@ export const exposures: MethodExposure[] = [
     sideEffect: 'read',
     example:
       "let sinceOffset = 0;\nwhile (true) {\n  const p = await runtime.agents.getReply(handle, { sinceOffset, wait: 'long-poll' });\n  for (const c of p.chunks) log(c.kind, c.data);\n  sinceOffset = p.nextOffset;\n  if (p.status !== 'streaming') break;\n}",
-    source: SRC,
     category: 'primary',
   },
   {
@@ -274,7 +254,6 @@ export const exposures: MethodExposure[] = [
     sideEffect: 'write',
     example:
       "const r = await runtime.agents.sendMessageAndAwait(oversightId, { text: 'Review this Charter change', timeoutMs: 30000 });",
-    source: SRC,
     category: 'primary',
   },
 
@@ -300,7 +279,6 @@ export const exposures: MethodExposure[] = [
     example:
       "const reply = await runtime.agents.sendText(agentId, 'List files');\n" +
       "while (!reply.finished) process.stdout.write(await reply.get());",
-    source: SRC,
     category: 'primary',
   },
   {
@@ -312,7 +290,6 @@ export const exposures: MethodExposure[] = [
       'Construct a LiveReply for an existing replyHandle (UI remounts, ' +
       'queue consumers resuming a known reply, etc.). Host-side only.',
     sideEffect: 'read',
-    source: SRC,
     category: 'support',
   },
 
@@ -328,7 +305,6 @@ export const exposures: MethodExposure[] = [
       'Return a Turn record by id (cloned). Null if unknown. Turns are the canonical ' +
       '"what happened" record of a prompt-reply pair — durable beyond the volatile ReplyRecord.',
     sideEffect: 'read',
-    source: SRC,
     category: 'primary',
   },
   {
@@ -341,7 +317,6 @@ export const exposures: MethodExposure[] = [
       'List Turns with optional filters. referencedBy filters to Turns that ' +
       'carry a specific inbound reference (e.g. all Turns referenced by an Activity).',
     sideEffect: 'read',
-    source: SRC,
     category: 'primary',
   },
   {
@@ -351,7 +326,6 @@ export const exposures: MethodExposure[] = [
     signature: '(opts?: ListTurnsOpts): Promise<number>',
     description: 'Count matching Turns.',
     sideEffect: 'read',
-    source: SRC,
     category: 'support',
   },
   {
@@ -362,7 +336,6 @@ export const exposures: MethodExposure[] = [
     description:
       "Find the currently-streaming Turn for an agent's session, when one is active.",
     sideEffect: 'read',
-    source: SRC,
     category: 'support',
   },
   {
@@ -377,7 +350,6 @@ export const exposures: MethodExposure[] = [
     sideEffect: 'write',
     example:
       "await runtime.agents.turns.addReference({ turnId: 'tur_...', reference: { kind: 'activity', ref: 'act_qb_general_1', position: 3 } });",
-    source: SRC,
     category: 'primary',
   },
 
@@ -391,7 +363,6 @@ export const exposures: MethodExposure[] = [
     signature: '(handle: string): Promise<ReplyRecord | null>',
     description: 'Return a ReplyRecord by handle (cloned). Null if unknown.',
     sideEffect: 'read',
-    source: SRC,
     category: 'support',
   },
   {
@@ -402,7 +373,6 @@ export const exposures: MethodExposure[] = [
       "(filter?: { agentId?: string; status?: 'streaming'|'complete'|'error'; since?: string }): Promise<ReplyRecord[]>",
     description: 'List ReplyRecords (newest first). Optional filter by agent / status / since.',
     sideEffect: 'read',
-    source: SRC,
     category: 'support',
   },
   {
@@ -413,7 +383,6 @@ export const exposures: MethodExposure[] = [
       "(filter?: { agentId?: string; status?: 'streaming'|'complete'|'error' }): Promise<number>",
     description: 'Count ReplyRecords, optionally filtered.',
     sideEffect: 'read',
-    source: SRC,
     category: 'support',
   },
 
@@ -430,7 +399,6 @@ export const exposures: MethodExposure[] = [
       "agents.sendMessage by agent.provider.kind. Built-ins seeded: " +
       "'bridge' (Claude via cowork-web-bridge) and 'mock' (tests).",
     sideEffect: 'write',
-    source: SRC,
     category: 'primary',
   },
   {
@@ -440,7 +408,6 @@ export const exposures: MethodExposure[] = [
     signature: '(kind: string): Promise<ProviderInfo | null>',
     description: 'Public info for one registered provider, or null.',
     sideEffect: 'read',
-    source: SRC,
     category: 'support',
   },
   {
@@ -450,7 +417,6 @@ export const exposures: MethodExposure[] = [
     signature: '(): Promise<ProviderInfo[]>',
     description: 'List all registered providers (sanitized info view).',
     sideEffect: 'read',
-    source: SRC,
     category: 'support',
   },
 ];
