@@ -95,6 +95,12 @@ export interface Agent {
   /**
    * Current bridge session this agent inhabits. NULL when status is
    * 'paused' (agent record persists, session is released back to pool).
+   *
+   * Back-compat field. Forward-compat path: this value will move into
+   * `provider` (as `BridgeProvider.sessionId`) when blur-agent's
+   * persistence layer migrates. New writers SHOULD set `provider`;
+   * readers SHOULD prefer `provider` and fall back to `sessionId` for
+   * older records. See `synthesizeProvider()` helper below.
    */
   sessionId: string | null;
 
@@ -102,8 +108,23 @@ export interface Agent {
    * Pool lease token if the agent's session was acquired via
    * runtime.pool.lease(). Held so agents.release() can hand it back.
    * Null for 'external' or 'manual' agents (no underlying pool lease).
+   *
+   * Back-compat field; see `sessionId` note above.
    */
   leaseToken?: string | null;
+
+  /**
+   * Provider that backs this agent — the inference target. New field
+   * (Decision 29 Phase A migration). Optional today; for records
+   * without it, `synthesizeProvider(agent)` materializes a
+   * BridgeProvider from `sessionId` / `leaseToken` so callers can
+   * always reach a provider record.
+   *
+   * Going forward, `provider` is the source of truth and top-level
+   * `sessionId` / `leaseToken` are deprecated. Phase E (Decision 29)
+   * eventually drops the top-level fields.
+   */
+  provider?: AgentProvider;
 
   /** What this agent is responsible for. May be empty for a fresh lease. */
   bindings: AgentBinding[];
@@ -119,6 +140,127 @@ export interface Agent {
   leasedFrom: AgentLeasedFrom;
   releasedAt?: string;
   updatedAt?: string;
+}
+
+// ===========================================================================
+// AgentProvider — the inference target backing an Agent
+//
+// Decision 29's central abstraction. An Agent's identity (id, role,
+// bindings, notes) is separable from the inference target. The provider
+// tagged union covers the targets we plan to support:
+//
+//   bridge   — Claude session via the bridge daemon (today: only mode)
+//   together — together.ai HTTP inference for non-Claude models
+//   openai   — OpenAI's API (incl. structured outputs, prompt cache)
+//   local    — locally-hosted inference server (OpenAI-compatible HTTP)
+//   mock     — in-process scripted replies (for tests)
+//
+// `leasedFrom` (pool / external / manual) stays on Agent; it answers
+// "where the capacity came from," orthogonal to "what model is on the
+// other end" (which is `provider.kind`).
+// ===========================================================================
+
+export type AgentProvider =
+  | BridgeProvider
+  | TogetherProvider
+  | OpenAIProvider
+  | LocalProvider
+  | MockProvider;
+
+/**
+ * Bridge-backed provider — a Claude session reached via the bridge
+ * daemon's request_reply / get_reply primitives. `sessionId` is the
+ * raw bridge session id; `leaseToken` (if present) was issued by the
+ * pool when the underlying session was acquired.
+ */
+export interface BridgeProvider {
+  kind: 'bridge';
+  /** Bridge session id, e.g. 'local_<uuid>'. */
+  sessionId: string;
+  /** Pool lease token; null/undefined for external/manual bridge sessions. */
+  leaseToken?: string | null;
+}
+
+/**
+ * Together.ai HTTP inference for Llama / Mistral / similar open models.
+ * Cost-efficient for oversight / lightweight roles.
+ */
+export interface TogetherProvider {
+  kind: 'together';
+  /** Together-side model id, e.g. 'meta-llama/Llama-3.1-8B-Instruct'. */
+  model: string;
+  /** Secret-store reference, e.g. 'env:TOGETHER_API_KEY'. */
+  apiKeyRef: string;
+  sampling?: SamplingParams;
+}
+
+/**
+ * OpenAI HTTP inference. Carries the API key reference plus sampling
+ * defaults; provider-native features (structured outputs, prompt cache,
+ * batch endpoints) are reached via the named escape hatch primitives at
+ * `runtime.agents.providers.openai.*` (Decision 29).
+ */
+export interface OpenAIProvider {
+  kind: 'openai';
+  /** OpenAI model id, e.g. 'gpt-4o-mini'. */
+  model: string;
+  /** Secret-store reference. */
+  apiKeyRef: string;
+  sampling?: SamplingParams;
+}
+
+/**
+ * Locally-hosted inference server speaking the OpenAI-compatible HTTP
+ * shape (llama.cpp server, vllm, ollama, etc.). The `endpoint` is the
+ * full base URL.
+ */
+export interface LocalProvider {
+  kind: 'local';
+  /** Local model id (server's own identifier). */
+  model: string;
+  /** HTTP endpoint, e.g. 'http://127.0.0.1:8080'. */
+  endpoint: string;
+  sampling?: SamplingParams;
+}
+
+/**
+ * In-process scripted provider for tests. `script` is an opaque key the
+ * mock implementation interprets — could be a canned reply identifier,
+ * a path to a scripted sequence, etc.
+ */
+export interface MockProvider {
+  kind: 'mock';
+  script?: string;
+}
+
+/**
+ * Sampling parameters common to HTTP-based providers. Not all providers
+ * honor all fields; unset means "use the provider's default."
+ */
+export interface SamplingParams {
+  temperature?: number;
+  topP?: number;
+  maxTokens?: number;
+  stop?: string[];
+}
+
+/**
+ * Build a BridgeProvider from an Agent's legacy top-level `sessionId` /
+ * `leaseToken` fields. Used by readers to materialize a provider record
+ * for agents persisted before the Decision 29 Phase A migration. New
+ * writers SHOULD set `Agent.provider` directly.
+ *
+ * Returns null when the agent has no sessionId AND no provider — there
+ * is nothing to synthesize against.
+ */
+export function synthesizeProvider(agent: Agent): AgentProvider | null {
+  if (agent.provider) return agent.provider;
+  if (!agent.sessionId) return null;
+  return {
+    kind: 'bridge',
+    sessionId: agent.sessionId,
+    leaseToken: agent.leaseToken ?? null,
+  };
 }
 
 // ===========================================================================
@@ -173,6 +315,14 @@ export interface LeaseOpts {
   leasedFrom?: AgentLeasedFrom;
   /** Pre-set sessionId for 'external' / 'manual' leases. */
   sessionId?: string;
+  /**
+   * Explicit inference target. Decision 29 Phase A: optional today, but
+   * the canonical place to put provider config going forward. When set,
+   * supersedes the synthesized BridgeProvider from `sessionId` /
+   * `leaseToken`. Required for non-bridge providers (together, openai,
+   * local, mock).
+   */
+  provider?: AgentProvider;
   /** Initial notes; commonly the handoff summary. */
   notes?: Array<Omit<AgentNote, 'at'>>;
   /** Author of the lease — usually the calling agent id. */
@@ -237,4 +387,194 @@ export interface RegisterRoleOpts {
 export interface UnregisterRoleOpts {
   id: string;
   by?: string;
+}
+
+// ===========================================================================
+// Reply types — the request/reply contract (Decision 29)
+//
+// Two-call shape:
+//   1. agents.sendMessage(agentId, opts) -> { replyHandle } — fires
+//      immediately; record minted; provider begins producing chunks.
+//   2. agents.getReply(replyHandle, opts?) -> ReplyPoll — long-poll
+//      pulls accumulated chunks plus a completion summary when the
+//      assistant-turn ends.
+//
+// A convenience wrapper `agents.sendMessageAndAwait(agentId, opts)`
+// loops getReply internally and returns the assembled `Reply` for
+// short-reply use cases (oversight checks against fast HTTP providers).
+// NEVER use the await wrapper for bridge-driven Claude turns — the
+// timeout assumption breaks.
+//
+// The realm-fragility caveat from Decision 29: subscribers don't
+// survive script.run boundaries, so PULL via getReply is the script
+// caller's path. Push-style streaming (audit.subscribe on
+// `agents.reply.chunk`) is available for long-lived consumers like UI
+// surfaces.
+// ===========================================================================
+
+/** One chunk of a streaming reply. Provider-side classification. */
+export interface ReplyChunk {
+  /** Monotonic per-record index. Pass back as `sinceOffset` to resume. */
+  offset: number;
+  /**
+   * Chunk taxonomy:
+   *   - 'text'         — assistant text
+   *   - 'tool-call'    — assistant tool_use
+   *   - 'tool-result'  — tool execution result
+   *   - 'event'        — provider-native metadata not in the standard
+   *                      kinds (Decision 29 doc note; opaque payload)
+   *   - 'meta'         — interruption markers etc.
+   */
+  kind: 'text' | 'tool-call' | 'tool-result' | 'event' | 'meta';
+  /** Shape varies by kind; recipients treat unknown payloads as opaque. */
+  data: unknown;
+  /** ISO 8601 timestamp the chunk landed. */
+  at: string;
+}
+
+/** Final-state summary attached to a completed ReplyRecord. */
+export interface ReplySummary {
+  startedAt: string;
+  endedAt: string;
+  durationMs: number;
+  /** Total length of all text chunks concatenated. */
+  textTotalLen: number;
+  /** Count of `tool-call` chunks observed in this reply. */
+  toolCallCount: number;
+  /** True iff the reply was cut short by timeout rather than naturally completing. */
+  truncatedByTimeout?: boolean;
+}
+
+/**
+ * Result of `agents.getReply()`. Callers loop while `more === true`,
+ * passing `nextOffset` back as `sinceOffset` on the following call.
+ */
+export interface ReplyPoll {
+  /** Chunks newer than the caller's `sinceOffset`. */
+  chunks: ReplyChunk[];
+  /** Pass as `sinceOffset` on the next poll to continue without re-fetching. */
+  nextOffset: number;
+  /** Current state of the reply. */
+  status: 'streaming' | 'complete' | 'error';
+  /** True iff more chunks may still arrive. */
+  more: boolean;
+  /** Present only when `status === 'complete'`. */
+  finalSummary?: ReplySummary;
+  /** Present only when `status === 'error'`. */
+  errorMessage?: string;
+}
+
+/**
+ * Assembled reply returned by `agents.sendMessageAndAwait()`. The
+ * convenience wrapper loops `getReply` internally and concatenates the
+ * text chunks into `text`, collects tool calls into `toolCalls`, and
+ * returns once status leaves 'streaming'. Throws on error or timeout.
+ */
+export interface Reply {
+  replyHandle: string;
+  agentId: string;
+  /** Concatenated text from all 'text'-kind chunks, in offset order. */
+  text: string;
+  /** Tool-call chunk payloads as observed. */
+  toolCalls: unknown[];
+  summary: ReplySummary;
+  /**
+   * Provider-native escape hatch. When the caller needs richer access
+   * than the standardized fields above (e.g. raw provider response for
+   * a non-portable feature), the provider may populate `raw`.
+   */
+  raw?: unknown;
+}
+
+/**
+ * The first-class record minted by `agents.sendMessage()`. Lives in
+ * the AgentRepliesSubsystem; persists across runtime restart via the
+ * Persistable interface (chunks NOT persisted — reconstructible from
+ * the upstream provider handle on load when supported by the provider).
+ */
+export interface ReplyRecord {
+  /** 'rep_<uuid>' — caller's handle for polling. */
+  handle: string;
+  /** Agent the reply is FROM. */
+  agentId: string;
+  /** Snapshot of the original request — text + timestamp + author. */
+  request: {
+    text: string;
+    at: string;
+    /** sessionId / agentId of the caller, if known. */
+    by?: string;
+  };
+  /** Provider kind, denormalized for fast filtering without dereferencing the agent. */
+  providerKind: AgentProvider['kind'];
+  status: 'streaming' | 'complete' | 'error';
+  startedAt: string;
+  endedAt?: string;
+  /**
+   * Append-only chunks. NOT persisted (Decision 29 — reconstructible).
+   * Materialized on load from the upstream provider when supported.
+   */
+  chunks: ReplyChunk[];
+  /** Final summary; populated when status transitions to 'complete'. */
+  finalSummary?: ReplySummary;
+  truncatedByTimeout?: boolean;
+  errorMessage?: string;
+  /**
+   * Upstream handle the provider returned (when applicable). For
+   * BridgeProvider, this is the bridge daemon's replyHandle. The
+   * AgentRepliesSubsystem polls the upstream handle to fill `chunks`
+   * after a runtime-restart-induced reload.
+   */
+  upstreamHandle?: string;
+}
+
+// ===========================================================================
+// SendMessage / GetReply opts
+// ===========================================================================
+
+/**
+ * Options for `agents.sendMessage()`. Free-form attachments and tool
+ * policy are provider-dependent — providers that don't support a given
+ * feature should fail loudly rather than silently degrade.
+ */
+export interface SendMessageOpts {
+  /** The message text. Required. */
+  text: string;
+  /** Optional attachments — provider-dependent support. */
+  attachments?: unknown[];
+  /** 'auto' lets the agent use tools; 'restricted' / 'none' disable them. */
+  toolPolicy?: 'auto' | 'restricted' | 'none';
+  /** sessionId / agentId of the caller, recorded on the ReplyRecord. */
+  by?: string;
+  /**
+   * Bypass deduplication. Default false. When false, an identical send
+   * within the provider's dedupe window returns the SAME replyHandle —
+   * idempotency for retries.
+   */
+  forceDuplicate?: boolean;
+  /**
+   * Caller-controlled dedupe key. When set, overrides the provider's
+   * default fingerprint input. Use for workflow-scoped dedupe, time-
+   * bucketed retries, or replay protection on a per-step basis.
+   */
+  idempotencyKey?: string;
+}
+
+/** Options for `agents.getReply()`. */
+export interface GetReplyOpts {
+  /** Last chunk offset already seen. Default 0 (start from the beginning). */
+  sinceOffset?: number;
+  /**
+   * 'none'      — return whatever's accumulated immediately.
+   * 'long-poll' — server holds the call until new chunks arrive or
+   *               `timeoutMs` elapses.
+   */
+  wait?: 'none' | 'long-poll';
+  /** Default 25_000 ms; capped well under MCP request timeout. */
+  timeoutMs?: number;
+}
+
+/** Options for `agents.sendMessageAndAwait()`. */
+export interface SendMessageAndAwaitOpts extends SendMessageOpts {
+  /** Total await timeout across all internal long-polls. Default 60_000 ms. */
+  timeoutMs?: number;
 }

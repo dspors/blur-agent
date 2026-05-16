@@ -218,4 +218,135 @@ export const exposures: MethodExposure[] = [
     source: SRC,
     category: 'support',
   },
+
+  // -------------------------------------------------------------------
+  // sendMessage / getReply / sendMessageAndAwait — Decision 29 contract
+  // -------------------------------------------------------------------
+  {
+    objectPath: 'agents',
+    method: 'sendMessage',
+    primitivePath: 'agents.sendMessage',
+    signature:
+      '(agentId: string, opts: { text: string; attachments?: unknown[]; toolPolicy?: "auto"|"restricted"|"none"; by?: string; forceDuplicate?: boolean; idempotencyKey?: string }): Promise<{ replyHandle: string }>',
+    description:
+      'Fire a message AS the agent and return a replyHandle. Pull-mode: ' +
+      'use agents.getReply(handle) to poll chunks. Dispatch by ' +
+      'agent.provider.kind; bridge agents delegate to ' +
+      'runtime.bridge.sessions.requestReply (cowork-web-bridge >=0.3.0). ' +
+      'For non-blocking-poll use cases see agents.sendMessageAndAwait.',
+    sideEffect: 'write',
+    example:
+      "const { replyHandle } = await runtime.agents.sendMessage(agentId, { text: 'Summarize last 3 commits' });",
+    source: SRC,
+    category: 'primary',
+  },
+  {
+    objectPath: 'agents',
+    method: 'getReply',
+    primitivePath: 'agents.getReply',
+    signature:
+      "(replyHandle: string, opts?: { sinceOffset?: number; wait?: 'none'|'long-poll'; timeoutMs?: number }): Promise<ReplyPoll>",
+    description:
+      'Pull-mode poll the ReplyRecord. Long-poll suspends until new ' +
+      'chunks land or status leaves "streaming" or timeoutMs (default ' +
+      '25000) elapses. Loop while result.more === true. nextOffset from ' +
+      'the prior poll resumes seamlessly across calls — record state ' +
+      'survives script.run boundaries.',
+    sideEffect: 'read',
+    example:
+      "let sinceOffset = 0;\nwhile (true) {\n  const p = await runtime.agents.getReply(handle, { sinceOffset, wait: 'long-poll' });\n  for (const c of p.chunks) log(c.kind, c.data);\n  sinceOffset = p.nextOffset;\n  if (p.status !== 'streaming') break;\n}",
+    source: SRC,
+    category: 'primary',
+  },
+  {
+    objectPath: 'agents',
+    method: 'sendMessageAndAwait',
+    primitivePath: 'agents.sendMessageAndAwait',
+    signature:
+      '(agentId: string, opts: { text: string; attachments?: unknown[]; toolPolicy?: "auto"|"restricted"|"none"; by?: string; forceDuplicate?: boolean; idempotencyKey?: string; timeoutMs?: number }): Promise<Reply>',
+    description:
+      'Convenience wrapper: sendMessage + loop getReply until non-' +
+      'streaming. Returns the assembled Reply (text concatenated, ' +
+      'toolCalls collected, finalSummary attached). NEVER use for ' +
+      'bridge-driven Claude turns — the timeout assumption breaks. ' +
+      'Use for short-reply HTTP providers (oversight checks etc.).',
+    sideEffect: 'write',
+    example:
+      "const r = await runtime.agents.sendMessageAndAwait(oversightId, { text: 'Review this Charter change', timeoutMs: 30000 });",
+    source: SRC,
+    category: 'primary',
+  },
+
+  // -------------------------------------------------------------------
+  // Replies subsystem read-side
+  // -------------------------------------------------------------------
+  {
+    objectPath: 'replies',
+    method: 'get',
+    primitivePath: 'agents.replies.get',
+    signature: '(handle: string): Promise<ReplyRecord | null>',
+    description: 'Return a ReplyRecord by handle (cloned). Null if unknown.',
+    sideEffect: 'read',
+    source: SRC,
+    category: 'support',
+  },
+  {
+    objectPath: 'replies',
+    method: 'list',
+    primitivePath: 'agents.replies.list',
+    signature:
+      "(filter?: { agentId?: string; status?: 'streaming'|'complete'|'error'; since?: string }): Promise<ReplyRecord[]>",
+    description: 'List ReplyRecords (newest first). Optional filter by agent / status / since.',
+    sideEffect: 'read',
+    source: SRC,
+    category: 'support',
+  },
+  {
+    objectPath: 'replies',
+    method: 'count',
+    primitivePath: 'agents.replies.count',
+    signature:
+      "(filter?: { agentId?: string; status?: 'streaming'|'complete'|'error' }): Promise<number>",
+    description: 'Count ReplyRecords, optionally filtered.',
+    sideEffect: 'read',
+    source: SRC,
+    category: 'support',
+  },
+
+  // -------------------------------------------------------------------
+  // Provider registry
+  // -------------------------------------------------------------------
+  {
+    objectPath: 'providers',
+    method: 'register',
+    primitivePath: 'agents.providers.register',
+    signature: '(impl: ProviderImpl): Promise<ProviderInfo>',
+    description:
+      'Register (or replace) a provider impl. The registry routes ' +
+      "agents.sendMessage by agent.provider.kind. Built-ins seeded: " +
+      "'bridge' (Claude via cowork-web-bridge) and 'mock' (tests).",
+    sideEffect: 'write',
+    source: SRC,
+    category: 'primary',
+  },
+  {
+    objectPath: 'providers',
+    method: 'get',
+    primitivePath: 'agents.providers.get',
+    signature: '(kind: string): Promise<ProviderInfo | null>',
+    description: 'Public info for one registered provider, or null.',
+    sideEffect: 'read',
+    source: SRC,
+    category: 'support',
+  },
+  {
+    objectPath: 'providers',
+    method: 'list',
+    primitivePath: 'agents.providers.list',
+    signature: '(): Promise<ProviderInfo[]>',
+    description: 'List all registered providers (sanitized info view).',
+    sideEffect: 'read',
+    source: SRC,
+    category: 'support',
+  },
 ];

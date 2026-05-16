@@ -37,14 +37,22 @@ import type {
   AgentRoleDef,
   AgentStatus,
   BindOpts,
+  GetReplyOpts,
   LeaseOpts,
   ListOpts,
   RegisterRoleOpts,
   ReleaseOpts,
+  Reply,
+  ReplyPoll,
+  SendMessageAndAwaitOpts,
+  SendMessageOpts,
   UnbindOpts,
   UnregisterRoleOpts,
   WhoAmIOpts,
 } from './types';
+import { synthesizeProvider } from './types';
+import type { AgentRepliesSubsystem } from './replies-subsystem';
+import type { ProviderRegistry } from './provider-registry';
 
 interface PersistedShape {
   agents: Agent[];
@@ -76,6 +84,18 @@ export class AgentsSubsystem {
   private byId = new Map<string, Agent>();
   private sessionIndex = new Map<string, string>(); // sessionId → agentId
   private rolesById = new Map<string, AgentRoleDef>();
+
+  /**
+   * Backref to the replies subsystem. Set by the pack install (avoids
+   * a circular import). Required for sendMessage / getReply.
+   */
+  repliesRef: AgentRepliesSubsystem | null = null;
+
+  /**
+   * Backref to the provider registry. Set by the pack install.
+   * Required for sendMessage dispatch.
+   */
+  providerRegistry: ProviderRegistry | null = null;
 
   constructor(public readonly runtime: BlurAIRuntime) {}
 
@@ -200,6 +220,7 @@ export class AgentsSubsystem {
       status: 'active',
       sessionId,
       leaseToken,
+      provider: opts.provider ? { ...opts.provider } as typeof opts.provider : undefined,
       bindings,
       handoff: opts.handoff ? { ...opts.handoff } : undefined,
       notes,
@@ -584,5 +605,151 @@ export class AgentsSubsystem {
 
   private emitEvent(kind: SemanticKind, opts: { ref?: string; data?: Record<string, unknown> }): void {
     this.runtime.audit.emit({ kind, ref: opts.ref, data: opts.data });
+  }
+
+  // ===================================================================
+  // sendMessage / getReply / sendMessageAndAwait — Decision 29 contract
+  //
+  // sendMessage:        fire; returns { replyHandle } in ms
+  // getReply:           pull; long-poll the ReplyRecord by handle
+  // sendMessageAndAwait: convenience wrapper — fire + loop getReply until
+  //                      status leaves 'streaming', return assembled Reply
+  //
+  // Dispatch is by agent.provider.kind (or synthesized BridgeProvider
+  // for back-compat agents). The ProviderRegistry must have an impl
+  // registered for the agent's provider kind.
+  // ===================================================================
+
+  async sendMessage(agentId: string, opts: SendMessageOpts): Promise<{ replyHandle: string }> {
+    if (typeof agentId !== 'string' || !agentId.trim()) {
+      throw new Error('agents.sendMessage: agentId is required (non-empty string)');
+    }
+    if (!opts || typeof opts !== 'object') {
+      throw new Error('agents.sendMessage: opts is required');
+    }
+    if (typeof opts.text !== 'string' || !opts.text) {
+      throw new Error('agents.sendMessage: opts.text is required (non-empty string)');
+    }
+
+    const agent = this.byId.get(agentId);
+    if (!agent) throw new Error(`agents.sendMessage: no such agentId '${agentId}'`);
+
+    if (agent.status !== 'active') {
+      throw new Error(
+        `agents.sendMessage: agent ${agentId} is '${agent.status}'; cannot send`,
+      );
+    }
+
+    if (!this.repliesRef || !this.providerRegistry) {
+      throw new Error(
+        'agents.sendMessage: replies subsystem and provider registry not wired. ' +
+        'Pack install may be incomplete.',
+      );
+    }
+
+    // Materialize provider — synthesized BridgeProvider for back-compat.
+    const resolvedProvider = synthesizeProvider(agent);
+    if (!resolvedProvider) {
+      throw new Error(
+        `agents.sendMessage: agent ${agentId} has no provider and no sessionId; cannot dispatch`,
+      );
+    }
+    // Ensure the agent's record carries the (possibly synthesized)
+    // provider so downstream ReplyRecord.providerKind etc. are honest.
+    const agentForDispatch: Agent =
+      agent.provider === resolvedProvider ? agent : { ...agent, provider: resolvedProvider };
+
+    const impl = this.providerRegistry.get(resolvedProvider.kind);
+    if (!impl) {
+      throw new Error(
+        `agents.sendMessage: no provider impl registered for kind '${resolvedProvider.kind}'. ` +
+        `Known: ${this.providerRegistry.list().map(p => p.kind).join(', ') || '<none>'}`,
+      );
+    }
+
+    const result = await impl.sendMessage(agentForDispatch, opts, this.repliesRef);
+    if (!result?.replyHandle) {
+      throw new Error(`agents.sendMessage: provider '${resolvedProvider.kind}' returned no replyHandle`);
+    }
+    return { replyHandle: result.replyHandle };
+  }
+
+  async getReply(replyHandle: string, opts?: GetReplyOpts): Promise<ReplyPoll> {
+    if (typeof replyHandle !== 'string' || !replyHandle.trim()) {
+      throw new Error('agents.getReply: replyHandle is required (non-empty string)');
+    }
+    if (!this.repliesRef) {
+      throw new Error('agents.getReply: replies subsystem not wired');
+    }
+    return this.repliesRef.getReply(replyHandle, opts);
+  }
+
+  /**
+   * Convenience: fire + loop getReply until non-streaming, return the
+   * assembled Reply. NEVER use for bridge-driven Claude turns — the
+   * timeout assumption breaks. Use sendMessage + getReply long-poll
+   * directly for those.
+   */
+  async sendMessageAndAwait(agentId: string, opts: SendMessageAndAwaitOpts): Promise<Reply> {
+    const totalTimeoutMs = opts.timeoutMs ?? 60_000;
+    const deadline = Date.now() + totalTimeoutMs;
+    const { replyHandle } = await this.sendMessage(agentId, opts);
+
+    const textParts: string[] = [];
+    const toolCalls: unknown[] = [];
+    let sinceOffset = 0;
+    let finalStatus: ReplyPoll['status'] = 'streaming';
+    let finalSummary: ReplyPoll['finalSummary'];
+    let errorMessage: string | undefined;
+
+    while (Date.now() < deadline) {
+      const remaining = deadline - Date.now();
+      const pollTimeout = Math.min(remaining, 25_000);
+      if (pollTimeout <= 0) break;
+      const poll = await this.getReply(replyHandle, {
+        sinceOffset,
+        wait: 'long-poll',
+        timeoutMs: pollTimeout,
+      });
+      for (const c of poll.chunks) {
+        if (c.kind === 'text') {
+          // Providers may emit text data as a raw string (mock) or as
+          // an object like { text: "..." } (bridge daemon's chunk
+          // shape from readSession). Accept both defensively.
+          if (typeof c.data === 'string') {
+            textParts.push(c.data);
+          } else if (c.data && typeof (c.data as { text?: unknown }).text === 'string') {
+            textParts.push((c.data as { text: string }).text);
+          }
+        } else if (c.kind === 'tool-call') {
+          toolCalls.push(c.data);
+        }
+      }
+      sinceOffset = poll.nextOffset;
+      finalStatus = poll.status;
+      finalSummary = poll.finalSummary;
+      errorMessage = poll.errorMessage;
+      if (poll.status !== 'streaming') break;
+    }
+
+    if (finalStatus === 'error') {
+      throw new Error(`agents.sendMessageAndAwait: reply errored — ${errorMessage ?? 'unknown'}`);
+    }
+    if (finalStatus !== 'complete') {
+      throw new Error(
+        `agents.sendMessageAndAwait: reply did not complete within ${totalTimeoutMs}ms`,
+      );
+    }
+    if (!finalSummary) {
+      throw new Error('agents.sendMessageAndAwait: reply complete but no finalSummary present');
+    }
+
+    return {
+      replyHandle,
+      agentId,
+      text: textParts.join(''),
+      toolCalls,
+      summary: { ...finalSummary },
+    };
   }
 }
