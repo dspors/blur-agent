@@ -79,6 +79,12 @@ export interface SchedulerAlgorithm {
 export class SchedulerSubsystem implements Persistable {
   private workItems = new Map<string, WorkItem>();
   private routingPolicy = new Map<string, RoutingPolicyEntry>();
+  /**
+   * Decision 31 Phase A — self-tracked dirty flag. Set true on every
+   * state-mutating call (incl. the private tryAssign which mutates
+   * item status from the tick timer); `consumeDirty()` returns + resets.
+   */
+  private _dirty = false;
 
   /**
    * Backref to AgentsSubsystem — set by the pack install. Needed so the
@@ -176,6 +182,7 @@ export class SchedulerSubsystem implements Persistable {
       status: 'queued',
     };
     this.workItems.set(id, item);
+    this._dirty = true;
     this.emit('agents.scheduler.work-submitted', `item:agents.scheduler.workItems[${id}]`, {
       workItemId: id,
       priority: item.priority,
@@ -204,6 +211,7 @@ export class SchedulerSubsystem implements Persistable {
     }
     item.status = 'running';
     item.startedAt = new Date().toISOString();
+    this._dirty = true;
     this.emit('agents.scheduler.work-started', `item:agents.scheduler.workItems[${workItemId}]`, {
       workItemId,
       agentId: item.assignedAgentId,
@@ -221,6 +229,7 @@ export class SchedulerSubsystem implements Persistable {
     }
     item.status = 'completed';
     item.completedAt = new Date().toISOString();
+    this._dirty = true;
     this.emit('agents.scheduler.work-completed', `item:agents.scheduler.workItems[${workItemId}]`, {
       workItemId,
       agentId: item.assignedAgentId,
@@ -238,6 +247,7 @@ export class SchedulerSubsystem implements Persistable {
     item.status = 'failed';
     item.completedAt = new Date().toISOString();
     item.errorMessage = errorMessage;
+    this._dirty = true;
     this.emit('agents.scheduler.work-failed', `item:agents.scheduler.workItems[${workItemId}]`, {
       workItemId,
       agentId: item.assignedAgentId,
@@ -257,6 +267,7 @@ export class SchedulerSubsystem implements Persistable {
     item.status = 'cancelled';
     item.completedAt = new Date().toISOString();
     if (reason) item.errorMessage = reason;
+    this._dirty = true;
     this.emit('agents.scheduler.work-cancelled', `item:agents.scheduler.workItems[${workItemId}]`, {
       workItemId,
       reason,
@@ -314,6 +325,7 @@ export class SchedulerSubsystem implements Persistable {
       registeredBy: opts.by,
     };
     this.routingPolicy.set(entry.kind, entry);
+    this._dirty = true;
     this.emit('agents.scheduler.routing-policy-set', `item:agents.scheduler.routingPolicy[${entry.kind}]`, {
       kind: entry.kind,
       defaultProviderKind: entry.defaultProviderKind,
@@ -369,6 +381,18 @@ export class SchedulerSubsystem implements Persistable {
         if (e && typeof e.kind === 'string') this.routingPolicy.set(e.kind, e);
       }
     }
+    // Restore is not a mutation.
+    this._dirty = false;
+  }
+
+  /**
+   * Decision 31 Phase A — Persistable.consumeDirty. Returns true iff
+   * scheduler state changed since the last call, and atomically resets.
+   */
+  consumeDirty(): boolean {
+    const d = this._dirty;
+    this._dirty = false;
+    return d;
   }
 
   // ===================================================================
@@ -431,6 +455,11 @@ export class SchedulerSubsystem implements Persistable {
     item.assignedAt = new Date().toISOString();
     item.reasonAssigned = decision.reason;
     this.lastAssignedAtByAgent.set(decision.agentId, Date.now());
+    // tryAssign mutates state from the tick timer (not via a public
+    // primitive call), so the persist subsystem won't see this in the
+    // run's dirtyByRun set. Self-track here so end-of-tick snapshots
+    // still happen.
+    this._dirty = true;
     this.emit('agents.scheduler.work-assigned', `item:agents.scheduler.workItems[${item.id}]`, {
       workItemId: item.id,
       agentId: decision.agentId,

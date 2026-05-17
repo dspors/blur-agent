@@ -115,6 +115,15 @@ export class TurnsSubsystem implements Persistable {
    */
   private activeBySession = new Map<string, string>();
 
+  /**
+   * Decision 31 Phase A — self-tracked dirty flag. Set true on every
+   * Turn-mutating call, including the async-event-driven side-effect
+   * collector `onAuditEvent` (which appends to turn.sideEffects when
+   * an audit event arrives during a streaming Turn). `consumeDirty()`
+   * returns + resets.
+   */
+  private _dirty = false;
+
   /** Unsubscribe function from the audit subscription. */
   private unsubAudit: (() => void) | null = null;
 
@@ -188,6 +197,7 @@ export class TurnsSubsystem implements Persistable {
     if (opts.agentSessionId) {
       this.activeBySession.set(opts.agentSessionId, id);
     }
+    this._dirty = true;
     this.emitAudit('agents.turn.opened', `item:agents.turns[${id}]`, {
       turnId: id,
       agentId: opts.agentId,
@@ -219,6 +229,7 @@ export class TurnsSubsystem implements Persistable {
       // tool-result, event, meta — captured by ReplyRecord, not mirrored
       // into the Turn for now. Available via Turn.replyHandle lookup.
     }
+    this._dirty = true;
     this.emitAudit('agents.turn.chunk', `item:agents.turns[${turnId}]`, {
       turnId,
       ingestedKinds: chunks.map(c => c.kind),
@@ -235,6 +246,7 @@ export class TurnsSubsystem implements Persistable {
     turn.endedAt = summary.endedAt || new Date().toISOString();
     turn.finalSummary = { ...summary };
     if (turn.agentSessionId) this.activeBySession.delete(turn.agentSessionId);
+    this._dirty = true;
     this.emitAudit('agents.turn.completed', `item:agents.turns[${turnId}]`, {
       turnId,
       durationMs: summary.durationMs,
@@ -252,6 +264,7 @@ export class TurnsSubsystem implements Persistable {
     turn.endedAt = new Date().toISOString();
     turn.errorMessage = errorMessage;
     if (turn.agentSessionId) this.activeBySession.delete(turn.agentSessionId);
+    this._dirty = true;
     this.emitAudit('agents.turn.errored', `item:agents.turns[${turnId}]`, {
       turnId,
       errorMessage,
@@ -276,6 +289,7 @@ export class TurnsSubsystem implements Persistable {
     );
     if (!exists) {
       turn.references.push(ref);
+      this._dirty = true;
       this.emitAudit('agents.turn.referenced', `item:agents.turns[${opts.turnId}]`, {
         turnId: opts.turnId,
         referenceKind: ref.kind,
@@ -379,6 +393,10 @@ export class TurnsSubsystem implements Persistable {
       op: deriveOp(entry.eventKind),
       data: entry.data,
     });
+    // Side-effect attribution mutates persisted state from outside the
+    // primitive-dispatch path. Self-flag so the next persist sweep
+    // captures the side-effects list.
+    this._dirty = true;
   }
 
   // -------------------------------------------------------------------
@@ -425,6 +443,18 @@ export class TurnsSubsystem implements Persistable {
         this.activeBySession.set(t.agentSessionId, t.id);
       }
     }
+    // Restore is not a mutation.
+    this._dirty = false;
+  }
+
+  /**
+   * Decision 31 Phase A — Persistable.consumeDirty. Returns true iff
+   * Turn state changed since the last call, and atomically resets.
+   */
+  consumeDirty(): boolean {
+    const d = this._dirty;
+    this._dirty = false;
+    return d;
   }
 
   // -------------------------------------------------------------------

@@ -86,6 +86,13 @@ export class AgentRepliesSubsystem implements Persistable {
   private byHandle = new Map<string, ReplyRecord>();
   private waiters = new Map<string, Waiter[]>();
   private sweepTimer: NodeJS.Timeout | null = null;
+  /**
+   * Decision 31 Phase A — self-tracked dirty flag. Set true on every
+   * ReplyRecord mutation, including the timer-driven sweep that
+   * deletes expired records and transitions stale streamers.
+   * `consumeDirty()` returns + resets.
+   */
+  private _dirty = false;
 
   constructor(public readonly runtime: BlurAIRuntime) {}
 
@@ -145,6 +152,7 @@ export class AgentRepliesSubsystem implements Persistable {
       upstreamHandle: opts.upstreamHandle,
     };
     this.byHandle.set(handle, record);
+    this._dirty = true;
     this.emit('agents.reply.created', `item:agents.replies[${handle}]`, {
       handle,
       agentId: opts.agentId,
@@ -182,6 +190,11 @@ export class AgentRepliesSubsystem implements Persistable {
       });
     }
     record.chunks.push(...normalized);
+    // ReplyRecord's chunks are stripped from saveJson (Decision 29), but
+    // the record-level metadata (totalChunkCount, lastActivityAt-style
+    // fields if any) is what we care about; flag dirty so the
+    // streaming-record metadata gets a fresh snapshot.
+    this._dirty = true;
     this.emit('agents.reply.chunk', `item:agents.replies[${handle}]`, {
       handle,
       newChunkCount: normalized.length,
@@ -200,6 +213,7 @@ export class AgentRepliesSubsystem implements Persistable {
     record.endedAt = summary.endedAt || new Date().toISOString();
     record.finalSummary = { ...summary };
     if (summary.truncatedByTimeout) record.truncatedByTimeout = true;
+    this._dirty = true;
     this.emit('agents.reply.complete', `item:agents.replies[${handle}]`, {
       handle,
       durationMs: summary.durationMs,
@@ -218,6 +232,7 @@ export class AgentRepliesSubsystem implements Persistable {
     record.status = 'error';
     record.endedAt = new Date().toISOString();
     record.errorMessage = errorMessage;
+    this._dirty = true;
     this.emit('agents.reply.error', `item:agents.replies[${handle}]`, {
       handle,
       errorMessage,
@@ -346,6 +361,18 @@ export class AgentRepliesSubsystem implements Persistable {
     for (const stub of parsed.records) {
       this.byHandle.set(stub.handle, { ...stub, chunks: [] });
     }
+    // Restore is not a mutation.
+    this._dirty = false;
+  }
+
+  /**
+   * Decision 31 Phase A — Persistable.consumeDirty. Returns true iff
+   * ReplyRecord state changed since the last call, and atomically resets.
+   */
+  consumeDirty(): boolean {
+    const d = this._dirty;
+    this._dirty = false;
+    return d;
   }
 
   // -------------------------------------------------------------------
@@ -376,6 +403,11 @@ export class AgentRepliesSubsystem implements Persistable {
       }
     }
     for (const h of toDelete) this.byHandle.delete(h);
+    // sweep mutates byHandle out-of-band (timer-driven, not a script
+    // primitive call). The fail() path inside the loop already flips
+    // _dirty for any timeouts it transitions; the TTL-delete loop also
+    // mutates state, so set the flag if we deleted anything.
+    if (toDelete.length > 0) this._dirty = true;
   }
 
   // -------------------------------------------------------------------

@@ -28,7 +28,7 @@
  */
 
 import { randomUUID } from 'crypto';
-import type { BlurAIRuntime } from 'blur-ai-runtime';
+import type { BlurAIRuntime, Persistable } from 'blur-ai-runtime';
 import type {
   AddNoteOpts,
   Agent,
@@ -83,10 +83,18 @@ interface PoolBridge {
   release(leaseToken: string): Promise<{ released: true }>;
 }
 
-export class AgentsSubsystem {
+export class AgentsSubsystem implements Persistable {
   private byId = new Map<string, Agent>();
   private sessionIndex = new Map<string, string>(); // sessionId → agentId
   private rolesById = new Map<string, AgentRoleDef>();
+  /**
+   * Decision 31 Phase A — self-tracked dirty flag. Set true on every
+   * agent/role/session mutation; `consumeDirty()` returns + resets.
+   * Formalizing the previously-duck-typed Persistable shape — the
+   * subsystem always had saveJson/loadJson, the interface assertion
+   * just wasn't declared.
+   */
+  private _dirty = false;
 
   /**
    * Backref to the replies subsystem. Set by the pack install (avoids
@@ -134,6 +142,7 @@ export class AgentsSubsystem {
       registeredBy: opts.by,
     };
     this.rolesById.set(id, def);
+    this._dirty = true;
     this.emitEvent('agents.role-registered', {
       ref: `item:agents.roles[${id}]`,
       data: { roleId: id, by: opts.by },
@@ -147,6 +156,7 @@ export class AgentsSubsystem {
     }
     const existed = this.rolesById.delete(opts.id);
     if (existed) {
+      this._dirty = true;
       this.emitEvent('agents.role-unregistered', {
         ref: `item:agents.roles[${opts.id}]`,
         data: { roleId: opts.id, by: opts.by },
@@ -242,6 +252,7 @@ export class AgentsSubsystem {
     };
     this.byId.set(id, agent);
     if (sessionId) this.sessionIndex.set(sessionId, id);
+    this._dirty = true;
     this.emit('agents.leased', agent, {
       role: agent.role,
       leasedFrom: agent.leasedFrom,
@@ -291,6 +302,7 @@ export class AgentsSubsystem {
     a.leaseToken = null;
     a.releasedAt = now;
     a.updatedAt = now;
+    this._dirty = true;
     this.emit('agents.released', a, { reason: opts.reason, by: opts.by });
     return this.snapshot(a);
   }
@@ -316,6 +328,7 @@ export class AgentsSubsystem {
     a.status = 'active';
     a.updatedAt = new Date().toISOString();
     this.sessionIndex.set(sessionId, id);
+    this._dirty = true;
     this.addNoteInternal(a, {
       kind: 'session-swap',
       text: `session swapped: ${oldSession ?? '<none>'} → ${sessionId}`,
@@ -353,6 +366,7 @@ export class AgentsSubsystem {
     a.sessionId = null;
     a.leaseToken = null;
     a.updatedAt = now;
+    this._dirty = true;
     this.addNoteInternal(a, {
       kind: 'session-swap',
       text: `paused${opts.reason ? `: ${opts.reason}` : ''}`,
@@ -387,6 +401,7 @@ export class AgentsSubsystem {
     );
     a.bindings.push(binding);
     a.updatedAt = now;
+    this._dirty = true;
     this.emit('agents.bound', a, { binding, by: opts.by });
     return this.snapshot(a);
   }
@@ -402,6 +417,7 @@ export class AgentsSubsystem {
     );
     if (a.bindings.length !== before) {
       a.updatedAt = new Date().toISOString();
+      this._dirty = true;
       this.emit('agents.unbound', a, { scope: opts.scope, ref: opts.ref, by: opts.by });
     }
     return this.snapshot(a);
@@ -544,6 +560,19 @@ export class AgentsSubsystem {
         }
       }
     }
+    // Restore is not a mutation.
+    this._dirty = false;
+  }
+
+  /**
+   * Decision 31 Phase A — Persistable.consumeDirty. Returns true iff
+   * agent/role/session state changed since the last call, and
+   * atomically resets.
+   */
+  consumeDirty(): boolean {
+    const d = this._dirty;
+    this._dirty = false;
+    return d;
   }
 
   // ===================================================================
@@ -570,6 +599,9 @@ export class AgentsSubsystem {
     };
     a.notes.push(note);
     a.updatedAt = note.at;
+    // Note + updatedAt mutates persisted Agent state. Single flag covers
+    // every caller (release/pause/attachSession/addNote).
+    this._dirty = true;
     this.emit('agents.note-added', a, { kind: note.kind, by: note.by });
   }
 
