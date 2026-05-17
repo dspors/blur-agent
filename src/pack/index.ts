@@ -29,17 +29,40 @@ import { AgentRepliesSubsystem } from './replies-subsystem';
 import { TurnsSubsystem } from './turns-subsystem';
 import { SchedulerSubsystem } from './scheduler-subsystem';
 import { ProviderRegistry } from './provider-registry';
+import { EngagementFlowSubsystem } from './engagement-flow-subsystem';
 import { bridgeProviderImpl } from './providers/bridge-provider';
 import { mockProviderImpl } from './providers/mock-provider';
 import { exposures } from './exposures';
 import { schedulerExposures } from './scheduler-exposures';
+import { engagementFlowExposures } from './engagement-flow-exposures';
 
 export { AgentsSubsystem } from './agents-subsystem';
 export { AgentRepliesSubsystem } from './replies-subsystem';
 export { TurnsSubsystem } from './turns-subsystem';
 export { SchedulerSubsystem } from './scheduler-subsystem';
 export { ProviderRegistry } from './provider-registry';
+export { EngagementFlowSubsystem } from './engagement-flow-subsystem';
 export { LiveReply } from './live-reply';
+export type {
+  EngagementFlowOptions,
+  LinkedOutput,
+  PrepData,
+  PrepDataAgent,
+  PrepDataProject,
+  PrepDataRuntime,
+  PrepDataTrackSummary,
+  PrepStepDescriptor,
+} from './engagement-flow-types';
+export type {
+  ListTicketsOpts,
+  RequestTurnOpts,
+  RequestTurnResult,
+  Ticket,
+  TicketHistory,
+  TicketHistoryEvent,
+  TicketStatus,
+  TicketTerminalReason,
+} from './ticket-types';
 export type {
   AssignmentResult,
   ListWorkItemsOpts,
@@ -177,6 +200,7 @@ const pack: LibraryPack = {
     const turns = new TurnsSubsystem(runtime);
     const scheduler = new SchedulerSubsystem(runtime);
     const providers = new ProviderRegistry();
+    const engagementFlow = new EngagementFlowSubsystem(runtime);
 
     // Wire the backrefs on the agents subsystem so the dispatch
     // methods (sendMessage / sendText / getReply / sendMessageAndAwait)
@@ -187,6 +211,11 @@ const pack: LibraryPack = {
 
     // Scheduler reaches into agents for candidate listing.
     scheduler.agentsRef = agents;
+
+    // Engagement-flow auto-lease subscriber calls agents.lease(...);
+    // dispatchTurn routes through scheduler.requestTurn (Decision 34).
+    engagementFlow.agentsRef = agents;
+    engagementFlow.schedulerRef = scheduler;
 
     // Register built-in providers. mock is fully functional; bridge
     // requires the cowork-web-bridge runtime-pack to be loaded for
@@ -227,16 +256,19 @@ const pack: LibraryPack = {
       }
     }
 
-    // Start TTL sweep on replies, audit-subscribe on turns, tick on scheduler.
+    // Start TTL sweep on replies, audit-subscribe on turns, tick on
+    // scheduler, audit-subscribe on engagement-flow.
     replies.start();
     turns.start();
     scheduler.start();
+    engagementFlow.start();
 
     return {
-      objects: { agents, replies, turns, scheduler, providers },
+      objects: { agents, replies, turns, scheduler, providers, engagementFlow },
       exposures: [
         ...exposures,
         ...schedulerExposures,
+        ...engagementFlowExposures,
         // Per-provider exposures (Decision 29 escape-hatch pattern).
         // Mounted under runtime.agents.providers.<kind>.*. Today none
         // of the built-in providers ship custom exposures; this picks
