@@ -2,17 +2,20 @@
 slug: agent-roles
 title: Agent Roles
 aliases: [roles, agent-types, role-catalog, sa-agent-roles, seeded-roles]
-keywords: [agent, role, conductor, secretary, scheduler, supervisor, configuration, run, oversight, runagent, scope, binding, register, catalog]
+keywords: [agent, role, conductor, secretary, scheduler, supervisor, configuration, run, oversight, coordinator, project-coordinator, runagent, scope, binding, register, catalog]
 summary: >
   Catalog of agent roles in blur-agent — supervisor, configuration,
-  conductor, run, oversight, secretary, scheduler. Each role declares
-  its responsibilities, default binding scopes, and handoff layout.
-  Roles are an open registry; new ones register at runtime.
+  conductor, run, oversight, secretary, scheduler, coordinator. Each
+  role declares its responsibilities, default binding scopes, and
+  handoff layout. Roles are an open registry; new ones register at
+  runtime. Coordinator (added 2026-05) carries cross-Track state
+  awareness as concurrent work grows; see role-project-coordinator
+  for the deep dive.
 type: architecture
 audience: [ai, human]
 status: settled
 tags: [agents, substrate, sa, roles]
-related: [lease-and-bind, whoami]
+related: [lease-and-bind, whoami, role-project-coordinator, supervisor-patterns]
 spotlight: true
 ---
 
@@ -23,21 +26,22 @@ An **Agent** is a durable record of "who is doing what." It pairs a
 project / track / arc this agent is responsible for) and an optional
 **handoff** pointer (where the agent reads its charter).
 
-The role catalog is an **open registry**. blur-agent seeds seven
+The role catalog is an **open registry**. blur-agent seeds eight
 default roles at install; packs and runtime callers can register
 additional roles via `runtime.agents.roles.register(...)`.
 
-## The seven seeded roles
+## The eight seeded roles
 
 | Role id | Label | Responsibility | Default binding scopes |
 |---|---|---|---|
-| `supervisor` | Supervisor | Cross-project, human-in-the-loop. Sets the north-star, resolves gate Decisions, leases Conductors, ratifies methodology changes. | `cross-project` |
+| `supervisor` | Supervisor | Cross-project, human-in-the-loop. Sets the north-star, resolves gate Decisions, leases Conductors, ratifies methodology changes. **Depth-first quality assessment per Track.** | `cross-project` |
 | `configuration` | Configuration Agent | Shapes project Charter and runtime configuration. Co-authors methodology with the Supervisor. Distinct per-project where helpful. | `project`, `cross-project` |
 | `conductor` | Conductor | Walks an Arc on a project. Promotes ready Moves, dispatches RunAgents, opens gates, resolves cross-Arc dependencies. **State-machine driver, NOT executor.** | `project`, `arc` |
 | `run` | RunAgent | Executes one Move at a time on a track. Generates Charter Steps, files Tickets, emits Telemetry. Bound at track scope so the next Move on the same track can reuse the agent. | `track`, `move` |
 | `oversight` | OversightAgent | Risk-watcher. Reads project + track state, raises Risks on the Charter, files high-severity Tickets when warranted. **Read-mostly; does not execute Moves.** | `project`, `track` |
 | `secretary` | Secretary Agent | Background extractor / organizer. Reads completed Engagements + Turn histories and writes structured outputs (project metadata, North Star transcripts, Decision logs). Mechanical sorting, not interpretation. Designed for cheap providers; many parallel passes run concurrently. | `project`, `cross-project` |
-| `scheduler` | Scheduler Agent | Resource optimizer for the WorkItem queue. Watches assignments, agent utilization, and recent outcomes; nudges assignment decisions on top of the deterministic algorithm. | `runtime`, `cross-project` |
+| `scheduler` | Scheduler Agent | Resource optimizer for the WorkItem queue. Watches assignments, agent utilization, and recent outcomes; nudges assignment decisions on top of the deterministic algorithm. **Mechanism: picks who runs.** | `runtime`, `cross-project` |
+| `coordinator` | Project Coordinator | **Breadth-first across Tracks.** Rolls up cross-Track state on a cadence, detects cross-stream conflicts (shared assignee / quota) + dependency resolutions, feeds digests to Supervisor and UI, hints priorities to Scheduler. **Policy/signal layer for fleet awareness.** See [role-project-coordinator](role-project-coordinator) for the deep dive. | `cross-project`, `runtime` |
 
 ## Binding scopes
 

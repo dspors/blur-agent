@@ -15,7 +15,7 @@ audience: [ai, human]
 status: settled
 spotlight: true
 tags: [agents, role, supervisor, oversight, methodology, gut-feel]
-related: [agent-roles, lease-and-bind, whoami]
+related: [agent-roles, lease-and-bind, whoami, role-project-coordinator]
 supersedes: []
 supersededBy: null
 ---
