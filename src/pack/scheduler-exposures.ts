@@ -139,6 +139,54 @@ export const schedulerExposures: MethodExposure[] = [
   },
 
   // ===================================================================
+  // Tickets (Decision 34 — engagement Turn dispatch)
+  // ===================================================================
+  {
+    objectPath: 'scheduler',
+    method: 'requestTurn',
+    primitivePath: 'agents.scheduler.requestTurn',
+    signature:
+      '(opts: { engagementId: string; prompt: string; preferredAgentId?: string; outcome?: string; by?: string; ttlMs?: number }): Promise<{ ticketId: string; agentId: string; turnId: string; replyHandle: string }>',
+    description:
+      'Issue a Ticket authorizing one Turn on an Engagement, dispatch via agents.sendMessage, and return the four identifiers needed to follow the dispatch. Agent resolution: opts.preferredAgentId > engagement.preferredAgentId > engagement.boundAgentIds[0]. Ticket TTL default 5min; sweep on the scheduler tick releases expired tickets. Emits agents.scheduler.ticket-issued; agents.scheduler.ticket-released fires on turn-completed / turn-errored / TTL-expiry / explicit releaseTicket. v1 (Decision 34): fail-soft gate — sendMessage without ticketId proceeds with an agents.send-without-ticket warning. v2 makes the gate fail-closed.',
+    sideEffect: 'external',
+    example:
+      "const t = await runtime.scheduler.requestTurn({ engagementId: 'eng_abc', prompt: 'Summarize last 3 commits', outcome: 'summary', by: 'user' });",
+    category: 'primary',
+  },
+  {
+    objectPath: 'scheduler',
+    method: 'releaseTicket',
+    primitivePath: 'agents.scheduler.releaseTicket',
+    signature: "(ticketId: string, reason?: 'completed'|'expired'|'cancelled'): void",
+    description:
+      'Release a ticket. Idempotent — releasing an already-terminal ticket is a no-op. Default reason: "cancelled". The Turn-completion subscriber uses "completed"; the TTL sweep uses "expired". Emits agents.scheduler.ticket-released.',
+    sideEffect: 'write',
+    category: 'primary',
+  },
+  {
+    objectPath: 'scheduler',
+    method: 'listTickets',
+    primitivePath: 'agents.scheduler.listTickets',
+    signature:
+      "(opts?: { engagementId?: string; agentId?: string; status?: 'issued'|'active'|'completed'|'expired'|'cancelled' | Array<...>; outcome?: string; includeHistory?: boolean; limit?: number }): Ticket[]",
+    description:
+      'List tickets; active-only by default. Pass { includeHistory: true } to merge terminal tickets from the per-engagement history ring. Newest first.',
+    sideEffect: 'read',
+    category: 'primary',
+  },
+  {
+    objectPath: 'scheduler',
+    method: 'ticketHistory',
+    primitivePath: 'agents.scheduler.tickets.history',
+    signature: '(ticketId: string): { ticketId: string; events: Array<{ at: string; kind: string; detail?: string }>; ticket: Ticket } | null',
+    description:
+      'Lifecycle history for one ticket — { issued, used, completed | expired | cancelled, ... }. Returns null when the ticket has never existed (or was evicted from the per-engagement history ring).',
+    sideEffect: 'read',
+    category: 'primary',
+  },
+
+  // ===================================================================
   // AI optimizer (observation-v0)
   // ===================================================================
   {

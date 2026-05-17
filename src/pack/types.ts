@@ -557,6 +557,15 @@ export interface SendMessageOpts {
    * bucketed retries, or replay protection on a per-step basis.
    */
   idempotencyKey?: string;
+  /**
+   * Ticket authorizing this dispatch (Decision 34). When supplied,
+   * AgentsSubsystem validates the ticket (must be `issued|active`,
+   * match agentId), stamps it onto the Turn record, and transitions
+   * the ticket to `active`. When omitted, sendMessage proceeds but
+   * emits an `agents.send-without-ticket` audit warning — v1 gate is
+   * fail-soft; v2 will require tickets.
+   */
+  ticketId?: string;
 }
 
 /** Options for `agents.getReply()`. */
@@ -725,6 +734,13 @@ export interface Turn {
   /** Mirror of ReplyRecord.finalSummary when status === 'complete'. */
   finalSummary?: ReplySummary;
   errorMessage?: string;
+
+  /**
+   * Ticket that authorized this Turn (Decision 34). Set when
+   * sendMessage was called with `opts.ticketId`. Lets downstream
+   * consumers map Turn → caller intent → cost via the ticket record.
+   */
+  ticketId?: string;
 }
 
 // ===========================================================================
@@ -738,6 +754,8 @@ export interface OpenTurnOpts {
   request: { text: string; at: string; by?: string };
   replyHandle: string;
   contextSent?: string | null;
+  /** Ticket authorizing this Turn (Decision 34). Stamped onto Turn.ticketId. */
+  ticketId?: string;
 }
 
 export interface ListTurnsOpts {

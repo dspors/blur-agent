@@ -192,6 +192,7 @@ export class TurnsSubsystem implements Persistable {
       references: [],
       status: 'streaming',
       startedAt: now,
+      ticketId: opts.ticketId,
     };
     this.byId.set(id, turn);
     if (opts.agentSessionId) {
@@ -203,6 +204,7 @@ export class TurnsSubsystem implements Persistable {
       agentId: opts.agentId,
       providerKind: opts.providerKind,
       replyHandle: opts.replyHandle,
+      ticketId: opts.ticketId,
     });
     return cloneTurn(turn);
   }

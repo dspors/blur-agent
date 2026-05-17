@@ -761,6 +761,7 @@ export class AgentsSubsystem implements Persistable {
         agentSessionId: extractSessionId(resolvedProvider),
         request: { text: opts.text, at: new Date().toISOString(), by: opts.by },
         replyHandle: result.replyHandle,
+        ticketId: opts.ticketId,
       });
       turnId = provisionalTurnId;
       // Spawn the chunk-mirror loop (background).
@@ -769,7 +770,26 @@ export class AgentsSubsystem implements Persistable {
       result = await doDispatch();
     }
 
+    // Decision 34 — fail-soft ticket gate. v1 emits a warning when
+    // sendMessage was called without a ticket. v2 will require one.
+    if (!opts.ticketId) {
+      this.emitFailSoftWarning(agentId, turnId, opts.by);
+    }
+
     return { replyHandle: result.replyHandle, turnId };
+  }
+
+  private emitFailSoftWarning(agentId: string, turnId: string | undefined, by?: string): void {
+    try {
+      const audit = (this.runtime as { audit?: { emit?: (e: { kind: string; ref?: string; data?: Record<string, unknown> }) => void } }).audit;
+      audit?.emit?.({
+        kind: 'agents.send-without-ticket',
+        ref: turnId ? `item:agents.turns[${turnId}]` : `item:agents[${agentId}]`,
+        data: { agentId, turnId, by },
+      });
+    } catch {
+      /* swallow — warning, never fatal */
+    }
   }
 
   /**
@@ -895,23 +915,16 @@ export class AgentsSubsystem implements Persistable {
     agentSessionId?: string | null;
     request: { text: string; at: string; by?: string };
     replyHandle: string;
+    ticketId?: string;
   }): void {
     if (!this.turnsRef) return;
-    // Use the internal mint path: pass the pre-generated id through
-    // openTurn by patching it onto the subsystem AFTER. The Turn record
-    // is created with a fresh id by openTurn; we need to align them.
-    // Simplest path: call openTurn and then re-key the result. Cleaner:
-    // expose a `openTurnWithId` on TurnsSubsystem. We use openTurn
-    // here and accept that the audit frame's turnId may differ from
-    // the persisted Turn.id in the rare race — addressable in a future
-    // pass. For correctness today, the alignment is critical for
-    // side-effect attribution, so use openTurnWithId.
     this.turnsRef.openTurnWithId(opts.provisionalTurnId, {
       agentId: opts.agentId,
       providerKind: opts.providerKind,
       agentSessionId: opts.agentSessionId,
       request: opts.request,
       replyHandle: opts.replyHandle,
+      ticketId: opts.ticketId,
     });
   }
 
