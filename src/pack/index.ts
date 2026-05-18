@@ -32,6 +32,7 @@ import { ProviderRegistry } from './provider-registry';
 import { EngagementFlowSubsystem } from './engagement-flow-subsystem';
 import { bridgeProviderImpl } from './providers/bridge-provider';
 import { mockProviderImpl } from './providers/mock-provider';
+import { installD29Adapters } from './providers/d29-provider-adapter';
 import { exposures } from './exposures';
 import { schedulerExposures } from './scheduler-exposures';
 import { engagementFlowExposures } from './engagement-flow-exposures';
@@ -222,6 +223,30 @@ const pack: LibraryPack = {
     // sendMessage to succeed, but the registration itself is fine.
     providers.register(mockProviderImpl());
     providers.register(bridgeProviderImpl(runtime));
+
+    // D29 adapters for blur-providers-core's inner providers
+    // (`local`, `together`). Bridges their sync-return ProviderRequest
+    // shape onto the D29 streaming-chunk shape. Skipped silently when
+    // the inner providerRegistry extension isn't loaded — production
+    // gets local+together when the providers pack is installed; mock-
+    // only test fixtures aren't affected.
+    // See general-activity-multi-provider-v1 §9 +
+    // src/pack/providers/d29-provider-adapter.ts.
+    const d29Result = installD29Adapters(runtime, { outer: providers });
+    if (d29Result.registered.length > 0) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[blur-agent] D29 adapter wired for: ${d29Result.registered.join(', ')}`,
+      );
+    }
+    if (d29Result.skipped.length > 0) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[blur-agent] D29 adapter skipped: ${d29Result.skipped
+          .map(s => `${s.kind} (${s.reason})`)
+          .join(', ')}`,
+      );
+    }
 
     // Seed the role catalog. Idempotent — duplicate seeds are
     // swallowed (load-from-disk may have already populated them).
