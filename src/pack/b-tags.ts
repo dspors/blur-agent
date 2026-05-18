@@ -13,7 +13,16 @@
 // Public types
 // ============================================================================
 
-export type BTagKind = 'b:s'; // v1: scripts only
+/**
+ * Supported tag kinds. The position counter is shared across all kinds
+ * in one model reply so `for="$N"` references resolve unambiguously.
+ *
+ *   `b:s` — script (full runtime.script.run access)
+ *   `b:p` — property read (host-side entity lookup + dot-path walk)
+ *
+ * Reserved (not yet implemented): `b:f`, `b:fu`, `b:fc`, `b:fw`, `b:l`, `b:c`.
+ */
+export type BTagKind = 'b:s' | 'b:p';
 
 export interface BTag {
   /** 1-based position across all extracted tags in source order. */
@@ -41,30 +50,24 @@ const RESULT_BODY_CAP_BYTES = 8192;
 /**
  * Extract `<b:*>` tags from a model reply.
  *
- * - Only `<b:s>...</b:s>` recognized in v1 (others are reserved).
+ * - Currently recognized: `<b:s>` (script) and `<b:p>` (property read).
  * - Tags are executed **regardless of whether they're inside ``` fences**.
- *   The original design treated fenced tags as content-only ("the model
- *   wants to display tag-shaped text without running it"), but chat-
- *   trained models (llama3.1, etc.) wrap code in fences by markdown
- *   convention — the "common case" of fenced tags IS execution intent.
- *   If we ever need a display-only escape, we'll teach the model a
- *   different one (HTML-style entity encoding or a `lang=blur-display`
- *   fence marker).
+ *   Chat-trained models (llama3.1, etc.) wrap code in fences by markdown
+ *   convention; the common case of fenced tags IS execution intent.
  * - Self-closing forms (`<b:s/>`) are not recognized in v1.
  * - Order is source order (left-to-right, top-to-bottom).
+ * - Position counter is SHARED across all kinds so `for="$N"` is unique.
  */
 export function parseBTags(source: string): BTag[] {
-  const tags: BTag[] = [];
+  // Collect all candidate matches (each kind by its own regex), then
+  // sort by source offset to get global source order, then number.
+  const candidates: Array<Omit<BTag, 'position'>> = [];
 
-  // Match: <b:s ...>body</b:s>
-  // Non-greedy body match; supports nested unrelated content but not
-  // nested <b:s> (parser is single-level for v1).
-  const re = /<b:s((?:\s+[^>]*)?)>([\s\S]*?)<\/b:s>/g;
+  // <b:s ...>body</b:s> — script
+  const reS = /<b:s((?:\s+[^>]*)?)>([\s\S]*?)<\/b:s>/g;
   let m: RegExpExecArray | null;
-  let pos = 1;
-  while ((m = re.exec(source)) !== null) {
-    tags.push({
-      position: pos++,
+  while ((m = reS.exec(source)) !== null) {
+    candidates.push({
       kind: 'b:s',
       attrs: parseAttrs(m[1] ?? ''),
       body: m[2] ?? '',
@@ -72,7 +75,23 @@ export function parseBTags(source: string): BTag[] {
       endOffset: m.index + m[0].length,
     });
   }
-  return tags;
+
+  // <b:p e="kind:id">path</b:p> — property read.
+  // Attributes are required (must include `e`); body is the dot-path.
+  const reP = /<b:p((?:\s+[^>]*)?)>([\s\S]*?)<\/b:p>/g;
+  while ((m = reP.exec(source)) !== null) {
+    candidates.push({
+      kind: 'b:p',
+      attrs: parseAttrs(m[1] ?? ''),
+      body: (m[2] ?? '').trim(),
+      startOffset: m.index,
+      endOffset: m.index + m[0].length,
+    });
+  }
+
+  // Source-order assignment of 1-based positions.
+  candidates.sort((a, b) => a.startOffset - b.startOffset);
+  return candidates.map((c, i) => ({ ...c, position: i + 1 }));
 }
 
 /**
@@ -96,16 +115,23 @@ function parseAttrs(attrString: string): Record<string, string> {
 // ============================================================================
 
 /**
- * Render a `<b:s-result>` (or `<b:s-error>`) for the given tag and
- * outcome. Truncates body at RESULT_BODY_CAP_BYTES and appends a
- * `<truncated original-size="N"/>` marker when over.
+ * Render a result envelope for the given tag and outcome. Truncates
+ * body at RESULT_BODY_CAP_BYTES and appends a `<truncated …/>` marker
+ * when over.
+ *
+ * Result tag naming convention: `<b:<kind-suffix>-result>` for ok,
+ * `<b:<kind-suffix>-error>` for error. Kinds:
+ *   b:s → b:s-result / b:s-error
+ *   b:p → b:p-result / b:p-error
  */
 export function renderTagResult(
   tag: BTag,
   status: TagResultStatus | 'error',
   body: string,
 ): string {
-  const tagName = status === 'error' ? 'b:s-error' : 'b:s-result';
+  const kindSuffix = tag.kind.slice('b:'.length); // 's' or 'p'
+  const tagName =
+    status === 'error' ? `b:${kindSuffix}-error` : `b:${kindSuffix}-result`;
   let safeBody = body;
   if (safeBody.length > RESULT_BODY_CAP_BYTES) {
     safeBody =

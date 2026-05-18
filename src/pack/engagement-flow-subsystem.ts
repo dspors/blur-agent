@@ -302,6 +302,89 @@ export class EngagementFlowSubsystem implements Persistable {
     void this.rehydrateScriptLoopState();
   }
 
+  // ===========================================================================
+  // <b:p> property-read tag — host-side entity lookup + dot-path walk
+  // ===========================================================================
+
+  /**
+   * v1 entity-kind resolver map. Each entry says: to resolve
+   * `<b:p e="<kind>:<id>">…</b:p>`, look up the extension at `extName`
+   * and call `<id>` through its `getMethod`.
+   *
+   * Lives host-side — bypasses the script-isolate proxy entirely, so
+   * it's immune to the `this`-binding issues that bite
+   * `runtime.script.run(...)` when the proxy strips the original method
+   * binding.
+   *
+   * v2 will auto-derive this map from the registered `MethodExposure`
+   * records (any exposure matching `<pack>.get(id)` becomes a tag),
+   * plus optional pack-declared overrides for non-standard shapes.
+   */
+  private static B_P_RESOLVERS: Record<string, { extName: string; getMethod: string }> = {
+    project: { extName: 'projects', getMethod: 'get' },
+    ticket: { extName: 'tickets', getMethod: 'get' },
+    decision: { extName: 'decisions', getMethod: 'get' },
+    engagement: { extName: 'engagements', getMethod: 'get' },
+    agent: { extName: 'agents', getMethod: 'get' },
+    turn: { extName: 'turns', getMethod: 'get' },
+  };
+
+  /**
+   * Resolve a `<b:p>` tag: parse `e="<kind>:<id>"`, fetch the entity,
+   * walk the dot-path in the tag body. Returns `{ ok, value, error }`
+   * shaped like a script result so the script-loop handler can splice
+   * it the same way.
+   */
+  private async resolveBPTag(tag: import('./b-tags').BTag): Promise<{
+    ok: boolean;
+    value?: unknown;
+    error?: string;
+  }> {
+    const e = tag.attrs.e;
+    if (!e) return { ok: false, error: '<b:p> requires e="<kind>:<id>" attribute' };
+    const sep = e.indexOf(':');
+    if (sep <= 0) {
+      return { ok: false, error: `<b:p e="${e}"> — expected "<kind>:<id>" form` };
+    }
+    const kind = e.slice(0, sep);
+    const id = e.slice(sep + 1);
+    const spec = EngagementFlowSubsystem.B_P_RESOLVERS[kind];
+    if (!spec) {
+      const known = Object.keys(EngagementFlowSubsystem.B_P_RESOLVERS).join(', ');
+      return {
+        ok: false,
+        error: `<b:p> unknown entity kind "${kind}". Known: ${known}.`,
+      };
+    }
+    const ext = (this.runtime as RuntimeShape).extensions?.get?.(spec.extName) as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    const getter = ext && (ext[spec.getMethod] as unknown);
+    if (typeof getter !== 'function') {
+      return {
+        ok: false,
+        error: `<b:p e="${e}"> — ${spec.extName}.${spec.getMethod} not available`,
+      };
+    }
+    let entity: unknown;
+    try {
+      // Invoke as a method so `this` is bound to the extension instance.
+      // Same gotcha the engagements.bindAgent call had — destructured
+      // method references lose `this`.
+      entity = await Promise.resolve((getter as (id: string) => unknown).call(ext, id));
+    } catch (err) {
+      return { ok: false, error: (err as Error)?.message ?? String(err) };
+    }
+    if (entity === null || entity === undefined) {
+      return { ok: false, error: `<b:p e="${e}"> — entity not found` };
+    }
+    // Walk the dot-path against the entity record.
+    const path = (tag.body ?? '').trim();
+    const value = path ? walkDotPath(entity, path) : entity;
+    return { ok: true, value };
+  }
+
   /**
    * Rebuild the `turnToEngagement` index from the durable engagement
    * store. The index maps `turnId → engagementId` for O(1) lookup when
@@ -1020,23 +1103,12 @@ export class EngagementFlowSubsystem implements Persistable {
       }
       this.scriptLoopIterations.set(engagementId, iter);
 
-      // Locate the script runner. Cast through any: BlurAIRuntime's typed
-      // surface may not declare `script.run`, but the host runtime exposes it.
+      // Locate the script runner for `<b:s>` tags. `<b:p>` doesn't need
+      // it (host-side resolver bypasses the script isolate). Only bail
+      // per-tag if `<b:s>` appears and the runner is missing.
       const scriptRunner = (this.runtime as unknown as {
         script?: { run?: (src: string) => Promise<{ value?: unknown; ok?: boolean; error?: string }> };
       }).script?.run;
-      if (typeof scriptRunner !== 'function') {
-        stats.terminationReason = 'error';
-        this.recordTurnStats(stats);
-        this.emit('turns.tag-executed', `item:turns[${turnId}]`, {
-          turnId,
-          engagementId,
-          iter,
-          error: 'runtime.script.run unavailable on host',
-          at: new Date().toISOString(),
-        });
-        return;
-      }
 
       this.emit('turns.iteration-started', `item:engagements[${engagementId}]`, {
         engagementId,
@@ -1047,15 +1119,25 @@ export class EngagementFlowSubsystem implements Persistable {
       });
 
       // Execute each tag in source order; accumulate timing + size into stats.
+      // Dispatch on tag.kind:
+      //   b:s — call runtime.script.run(body) (full expressivity, slow path)
+      //   b:p — call this.resolveBPTag(tag)   (host-side entity get + dot-path)
       const resultBlocks: string[] = [];
       for (const tag of tags) {
         const t0 = Date.now();
         try {
-          const r = await scriptRunner(tag.body);
+          let r: { ok?: boolean; value?: unknown; error?: string };
+          if (tag.kind === 'b:p') {
+            r = await this.resolveBPTag(tag);
+          } else if (typeof scriptRunner === 'function') {
+            r = await scriptRunner(tag.body);
+          } else {
+            r = { ok: false, error: 'runtime.script.run unavailable on host' };
+          }
           const execMs = Date.now() - t0;
           stats.scriptExecMs += execMs;
           if (r && r.ok === false) {
-            const msg = r.error ?? 'script run failed';
+            const msg = r.error ?? `${tag.kind} run failed`;
             const block = renderTagResult(tag, 'error', msg);
             resultBlocks.push(block);
             this.emit('turns.tag-executed', `item:turns[${turnId}]`, {
@@ -1776,6 +1858,31 @@ function truncate(s: string, max: number): string {
 }
 
 /**
+ * Walk a dot-path against a JSON-shaped object. Used by the `<b:p>`
+ * handler to resolve `direction.northStar`-style paths against an
+ * entity record. Behaviour:
+ *
+ *   - empty / missing path → return the object itself
+ *   - any intermediate segment that's null/undefined → return that
+ *     (matches the model's `?.` chain expectation: "the path didn't
+ *     resolve" returns the nullish, not an error)
+ *   - segment resolves against a non-object → return undefined
+ *   - segments may use `[0]` or numeric `.0` for array indexing
+ */
+function walkDotPath(obj: unknown, path: string): unknown {
+  if (!path) return obj;
+  // Normalize `[i]` → `.i` so we can split on a single delimiter.
+  const segments = path.replace(/\[(\w+)\]/g, '.$1').split('.').filter(Boolean);
+  let cur: unknown = obj;
+  for (const seg of segments) {
+    if (cur === null || cur === undefined) return cur;
+    if (typeof cur !== 'object') return undefined;
+    cur = (cur as Record<string, unknown>)[seg];
+  }
+  return cur;
+}
+
+/**
  * Static protocol-teaching block prepended to every dispatch. Byte-stable
  * — never includes timestamps or per-Turn drift. Cache-friendly per
  * state-advancement-loop §9.
@@ -1787,36 +1894,55 @@ function truncate(s: string, max: number): string {
 const PROTOCOL_TEACHING_BLOCK = [
   '[Blur protocol — read once, apply each reply]',
   '',
-  'You operate inside the Blur runtime. To advance project state, emit',
-  'JavaScript snippets inside `<b:s>…</b:s>` tags in your reply. The',
-  'substrate parses every `<b:s>` block, executes it via',
-  '`runtime.script.run` against the Blur runtime, and appends each',
-  'result as `<b:s-result for="$N">…</b:s-result>` (or',
-  '`<b:s-error for="$N">…</b:s-error>` on failure) to a follow-up',
-  'message. You can read those results and decide what to do next.',
+  'You operate inside the Blur runtime. Two tags let you advance state:',
+  '',
+  '  <b:p e="<kind>:<id>">field.path</b:p>  — READ a field from one',
+  '    entity record. Fast, host-side, no script execution. Preferred',
+  '    for simple reads. Known kinds:',
+  '      project, ticket, decision, engagement, agent, turn',
+  '    Examples:',
+  '      <b:p e="project:qb">label</b:p>',
+  '      <b:p e="project:blur-project-framework">charter.definition.title</b:p>',
+  '      <b:p e="ticket:tkt_abc">title</b:p>',
+  '    Body is a dot-path (with optional [i] indexing). Empty body =',
+  '    return the whole record.',
+  '',
+  '  <b:s>code</b:s>                         — execute a JavaScript /',
+  '    TypeScript snippet via `runtime.script.run`. Use when `<b:p>`',
+  '    is insufficient: computed values, multi-step reads, mutations,',
+  '    audit-event queries, etc. Async; you may `await` and `return`.',
+  '    The runtime object is in scope as `runtime`.',
+  '    Example primitives: `runtime.projects.list({...})`,',
+  '    `runtime.tickets.list({...})`, `runtime.audit.recentEvents({...})`.',
+  '    For mutations, use the write primitives directly inside the script.',
+  '',
+  'The substrate parses every tag, executes it, and appends each result',
+  'as `<b:p-result for="$N">…</b:p-result>` / `<b:s-result for="$N">…</b:s-result>`',
+  '(or the matching `-error` variant) to a follow-up message. You can',
+  'read those results and decide what to do next.',
   '',
   'Tag syntax (precise — small variations break execution):',
+  '  <b:p e="kind:id">path</b:p>              — property read',
   '  <b:s>code</b:s>                          — execute code',
   '  <b:s isolate="hermetic">code</b:s>       — fresh isolate for this block',
   '',
-  'Do NOT write `<b:s-isolate=…>` or `<b:script>` or `<bs>` — those',
-  'forms are not recognized. The opening tag is always exactly `<b:s`',
-  'optionally followed by attributes, then `>`.',
+  'Do NOT write `<b:s-isolate=…>`, `<b:script>`, `<bs>`, `<b-p>` or',
+  'similar variants — those forms are not recognized. Opening tags',
+  'are exactly `<b:s` or `<b:p` optionally followed by attributes,',
+  'then `>`.',
   '',
   'Rules:',
-  '  - Each `<b:s>` body is one async TypeScript/JavaScript snippet.',
-  '    You can `await` and you can `return` a value to be reported.',
-  '    The runtime object is in scope as `runtime`. Example primitives:',
-  '    `runtime.projects.get(id)`, `runtime.tickets.list({…})`,',
-  '    `runtime.audit.recentEvents({…})`.',
-  '  - Multiple `<b:s>` blocks in one reply run in source order and',
-  '    share scope (variables declared in block 1 are visible in block 2).',
-  '  - A reply with **zero** `<b:s>` tags ends the Turn. The substrate',
-  '    treats your reply as the final answer to the user.',
+  '  - Multiple tags in one reply run in source order; positions are',
+  '    numbered across all kinds (so `<b:p>` then `<b:s>` means $1 and',
+  '    $2). Within a Turn, `<b:s>` blocks share scope (variables in',
+  '    block 1 are visible in block 2). Opt out with',
+  '    `<b:s isolate="hermetic">…</b:s>`.',
+  '  - A reply with **zero** tags ends the Turn. The substrate treats',
+  '    your reply as the final answer to the user.',
   '  - The substrate caps the loop at 64 iterations per Turn; emit a',
-  '    script-free reply when you have what you need.',
-  '  - You may wrap `<b:s>…</b:s>` in markdown ``` fences or not — both',
-  '    forms execute. Tags are matched anywhere in your reply.',
+  '    tag-free reply when you have what you need.',
+  '  - You may wrap tags in markdown ``` fences or not — both forms',
+  '    execute. Tags are matched anywhere in your reply.',
   '',
   'Interpreting `<b:s-result>` bodies:',
   '  - JSON-shaped content → the script returned an object or array.',
@@ -1837,11 +1963,24 @@ const PROTOCOL_TEACHING_BLOCK = [
   'Then read where the field actually lives and try again.',
   '',
   'Workflow you typically follow:',
-  '  1. Read whatever state matters: `<b:s>return await runtime.projects.get("…");</b:s>`',
-  '  2. The substrate executes it; you see a `<b:s-result>` block.',
-  '  3. Reason about the result. If you need more, emit another `<b:s>`.',
+  '  1. Read whatever state matters. Prefer `<b:p>` for single-field',
+  '     reads: `<b:p e="project:qb">label</b:p>`. Use `<b:s>` for',
+  '     anything that needs computation, multiple fetches, or writes.',
+  '  2. The substrate executes; you see a `<b:p-result>` or',
+  '     `<b:s-result>` block with the value.',
+  '  3. Reason about the result. If you need more, emit another tag.',
   '  4. When you have enough to answer the user, write the answer as',
-  '     plain prose with **no** `<b:s>` tags. Turn ends.',
+  '     plain prose with **no** tags. Turn ends.',
+  '',
+  'A common first-Turn move:',
+  '  user: "what is the label of this project?"',
+  '  you:  `<b:p e="project:blur-project-framework">label</b:p>`',
+  '  (substrate runs it, appends the result)',
+  '  you again: "The label is: …" (no tags — Turn ends.)',
+  '',
+  'If you read a path that doesn\'t exist, you\'ll see a `<b:p-error>`',
+  'telling you what went wrong. To inspect a record\'s shape, read it',
+  'with no path: `<b:p e="project:qb"></b:p>` returns the whole record.',
   '',
 ].join('\n');
 
