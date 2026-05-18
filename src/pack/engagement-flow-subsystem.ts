@@ -22,6 +22,7 @@ import type { BlurAIRuntime, Persistable } from 'blur-ai-runtime';
 
 import type { AgentsSubsystem } from './agents-subsystem';
 import type { SchedulerSubsystem } from './scheduler-subsystem';
+import { resolveDispatch } from './scheduler-routing';
 import {
   DEFAULT_PREP_STEPS,
   LINKER_OUTPUT_KINDS,
@@ -360,22 +361,89 @@ export class EngagementFlowSubsystem implements Persistable {
       const bindings = projectId
         ? [{ scope: 'project' as const, ref: projectId }]
         : [{ scope: 'runtime' as const, ref: 'global' }];
+
+      // Consult the routing chain (same resolver scheduler.requestTurn uses)
+      // BEFORE deciding how to lease. The resolver walks
+      //   opts.pin → opts.activityTable → engagement.runtimeModel
+      //     → runtime.activityRouting → baseline
+      // For non-bridge providers we mint an Agent directly via
+      // leasedFrom='manual' with a provider hint, skipping the Claude
+      // pool (which has no meaning for stateless HTTP providers like
+      // local Ollama or together).
+      //
+      // The Config Tables (system Activity Table + Model Table) are read
+      // from this.schedulerRef when wired. When not yet wired (substrate
+      // boot before pack install / table reload), resolveDispatch falls
+      // through to the engagement.runtimeModel layer — sufficient for
+      // engagements that have a per-engagement pin set.
+      const resolved = resolveDispatch({
+        opts: {},
+        engagement: {
+          activityId: (engagement as { activityId?: string }).activityId ?? 'unknown',
+          runtimeModel: (engagement as { runtimeModel?: string }).runtimeModel,
+        },
+        systemActivityTable: null,
+        modelTable: null,
+      });
+
+      // Provider routing: bridge keeps pool semantics; everything else
+      // (local / together / mock / future stateless) leases manually
+      // with the resolved provider hint.
+      const resolvedKind = resolved.providerKind;
+      // For non-table-resolved cases, derive providerModelId from the
+      // modelRef tail. ModelTable lookup is the canonical path once
+      // tables are live; this is the fallback during the rollout.
+      const inferredModelId =
+        resolved.providerModelId
+        ?? (resolved.modelRef.includes('/')
+          ? resolved.modelRef.slice(resolved.modelRef.indexOf('/') + 1)
+          : null);
+
       try {
-        const agent = await agents.lease({
-          role,
-          label: `auto-lease for ${engagementId}`,
-          bindings,
-          leasedFrom: 'pool',
-          by: 'engagementFlow.auto-lease',
-        });
-        sessionId = (agent.sessionId as string | undefined) ?? `unknown-sess_${engagementId}`;
-        providerKind = (agent.provider as { kind?: string } | undefined)?.kind ?? 'unknown';
-        agentId = agent.id;
+        if (resolvedKind === 'bridge' || resolvedKind === 'unknown') {
+          // Existing pool path — Claude session pool semantics.
+          const agent = await agents.lease({
+            role,
+            label: `auto-lease for ${engagementId}`,
+            bindings,
+            leasedFrom: 'pool',
+            by: 'engagementFlow.auto-lease',
+          });
+          sessionId = (agent.sessionId as string | undefined) ?? `unknown-sess_${engagementId}`;
+          providerKind = (agent.provider as { kind?: string } | undefined)?.kind ?? 'unknown';
+          agentId = agent.id;
+        } else {
+          // Stateless-provider path — no pool. Mint an Agent record
+          // directly with the resolved provider info. Works for
+          // local / together / mock and any future HTTP-stateless
+          // provider that registers via Decision 29's ProviderRegistry.
+          const sid = `${resolvedKind}-sess_${engagementId}`;
+          const agent = await agents.lease({
+            role,
+            label: `auto-lease (${resolvedKind}) for ${engagementId} → ${resolved.modelRef}`,
+            bindings,
+            leasedFrom: 'manual',
+            sessionId: sid,
+            provider: {
+              kind: resolvedKind,
+              model: inferredModelId ?? undefined,
+            } as { kind: string; model?: string; sessionId?: string },
+            by: `engagementFlow.auto-lease (routing: ${resolved.source})`,
+          } as Parameters<typeof agents.lease>[0]);
+          sessionId = sid;
+          providerKind = resolvedKind;
+          agentId = agent.id;
+        }
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         this.emit('engagements.scheduler.lease-failed', `item:engagements[${engagementId}]`, {
           engagementId,
           error: message,
+          resolution: {
+            modelRef: resolved.modelRef,
+            providerKind: resolved.providerKind,
+            source: resolved.source,
+          },
           at: new Date().toISOString(),
         });
         throw err;
