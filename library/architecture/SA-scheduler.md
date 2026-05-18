@@ -501,29 +501,47 @@ The integration points:
 - **Pin failure** falls back per D36 §Pin failure semantics; emits
   `agents.scheduler.pin-fallback`.
 
-### Migration plan
+### Migration plan + status (2026-05-18)
 
 The Scheduler does not rewrite its `routingPolicy` to the new shape
-in a single commit. The plan:
+in a single commit. v1 implementation per
+[`general-activity-multi-provider-v1`](general-activity-multi-provider-v1)
+landed as a sequence of independently-shippable commits:
 
-1. **Add Activity Table opts** to `requestTurn` (`pin`,
-   `activityTable`, `complexity`). No behavior change yet — opts
-   are recorded on the ticket but routing still uses the v0 path.
-2. **Implement Mode=Always Activity Table lookup** (the cheapest
-   path; no AI-Choose yet). Routing-policy entries gain a `mode`
-   field defaulting to `'always'`; the new field is honored when
-   present.
-3. **Implement Mode=AI / AI-Choose stub**. AI-Choose initially
-   returns the Activity default; the call shape and audit
-   plumbing land first, intelligence later.
-4. **Implement Mode=Auto + escalation hint**. Caller's
-   `complexity: 'specialized'` triggers AI-Choose; rest use default.
-5. **Make AI-Choose real**. Move from stub to actual model call;
-   evaluation begins.
+1. ✅ **Step 1 — caller-side opts.** `pin`, `activityTable`,
+   `complexity` accepted on `requestTurn`; recorded on
+   `ticket.requestOverrides`; no routing change. (D36 step 1)
+2. ✅ **Step 2 — substrate tables.** `runtime.tables`
+   (ConfigTablesSubsystem) ships in blur-ai-runtime with on-disk
+   Model Table + Activity Table; read-only views as `runtime.models.*`
+   and `runtime.activityRouting.*`. (See SA-engagement-flow.)
+3. ✅ **Step 2.5 — D29 adapter.** `local` + `together` providers
+   from blur-providers-core are wrapped into `agents.providers.register`
+   shape via `src/pack/providers/d29-provider-adapter.ts`.
+4. ✅ **Step 3 — override-chain resolution.** Implemented in
+   `src/pack/scheduler-routing.ts` (`resolveDispatch`). Walks pin →
+   caller-table → `engagement.runtimeModel` → system Activity Table
+   → AI-Choose stub → baseline. Stamps `selectedModelRef` +
+   `selectionSource` + `selectionRationale` on the Ticket. Threads
+   the resolved provider-native id through `SendMessageOpts.model`
+   to the D29 adapter / providers. Pin-fallback when
+   resolved providerKind ≠ agent kind (v1 fail-soft).
 
-Each step is independently shippable; callers see the new opts
-working as soon as step 1 lands; intelligence improves over time
-without contract churn.
+Remaining (deferred):
+
+5. **Step 3a — cross-provider re-routing.** When a pin targets a
+   different providerKind than the bound agent, mint an ephemeral
+   agent of the resolved kind via `agents.lease` + `leasedFrom:'manual'`.
+   v1 falls back to the bound agent's model + emits
+   `agents.scheduler.pin-fallback`.
+6. **Step 4 — AI-Choose real implementation.** `aiChooseStub`
+   callback in `resolveDispatch` is the contract point. Today it's
+   unset (Mode=auto+specialized and Mode=ai fall back to the
+   Activity default). Step 4 wires a real router (probably a small
+   local model) without resolver-API churn.
+
+The contract surface is stable; the algorithm inside `aiChooseStub`
+is explicitly evolutionary per Decision 36.
 
 ---
 

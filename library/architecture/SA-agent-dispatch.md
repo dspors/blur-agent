@@ -144,8 +144,14 @@ roles in one record:
 - **Attribution** — every Turn carries `ticketId`. Joining Turn →
   Ticket → caller intent → (future) cost is a one-query operation.
 - **Routing** — `outcome?: string` records caller intent
-  (`'summary'`, `'risk-check'`, `'code-gen'`, ...). v1 records; v2
-  may consult for model-tier selection.
+  (`'summary'`, `'risk-check'`, `'code-gen'`, ...). Now (D36 step 2)
+  the Ticket also carries `selectedModelRef`, `selectionSource`
+  (`'pin' | 'caller-table' | 'engagement' | 'activity-default' |
+  'ai-choose' | 'baseline'`), and `selectionRationale` — the
+  resolved selection from the override chain. UI's Turn-card chip +
+  routing pane read these directly. See
+  [`general-activity-multi-provider-v1`](general-activity-multi-provider-v1)
+  for the v1 implementation contract.
 
 Lifecycle:
 
@@ -251,10 +257,17 @@ selection, what happens when a caller **pins** or **overrides**.
 
 The routing contract is captured in
 **[Decision 36 — Scheduler routing model](36-scheduler-routing-model)**.
+The v1 implementation contract — provider catalog, on-disk Model
+Table + Activity Table, `engagement.runtimeModel` per-engagement
+override, and the General Activity end-to-end anchor — is in
+**[general-activity-multi-provider-v1](general-activity-multi-provider-v1)**.
+
 In summary:
 
 - A layered policy: per-call `pin` → caller-supplied Activity Table →
-  system Activity Table → AI-Choose → baseline.
+  per-engagement `runtimeModel` → system Activity Table → AI-Choose →
+  baseline. Resolution lives in `src/pack/scheduler-routing.ts`
+  (`resolveDispatch`); shipped 2026-05-18.
 - An **Activity Table** maps each Activity to a default
   `(provider, model)` plus a **Mode** (`Always` / `Auto` / `AI`)
   controlling when intelligent routing runs.
