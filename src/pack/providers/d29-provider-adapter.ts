@@ -171,9 +171,32 @@ export function d29ProviderAdapter(
       // pins / engagement.runtimeModel / Activity Table defaults actually
       // change what runs at dispatch time — not just what's recorded.
       const model = sendOpts.model ?? (provider as { model?: string }).model;
+
+      // KV-cache-aware params for local (Ollama / llama.cpp) provider.
+      // See `runtime.library.get('blur-inference-paradigm')` §11.
+      //
+      //   keep_alive: -1  → model + KV cache stay resident indefinitely.
+      //                     Without this, Ollama unloads after 5 min of
+      //                     silence and the next Turn pays full cold-start.
+      //   num_ctx:    8192 → fixed context window. Ollama auto-sizes
+      //                     `num_ctx` per request by default; auto-sizing
+      //                     re-allocates the KV buffer on every call and
+      //                     destroys the cache. Pinning at a constant
+      //                     keeps the cache reusable across Turns.
+      //
+      // The inner Ollama provider (blur-providers) must forward
+      // `params.keep_alive` / `params.num_ctx` to its Ollama HTTP body
+      // for these to take effect. Pre-forwarding makes this edit a
+      // no-op until the inner side lands — see companion ticket.
+      const params: Record<string, unknown> | undefined =
+        opts.kind === 'local'
+          ? { keep_alive: -1, num_ctx: 8192 }
+          : undefined;
+
       const req: InnerProviderRequest = {
         messages: [{ role: 'user', content: sendOpts.text }],
         ...(model !== undefined ? { model } : {}),
+        ...(params !== undefined ? { params } : {}),
       };
 
       // Dispatch async; failures land on the reply, not the synchronous

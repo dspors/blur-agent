@@ -486,11 +486,15 @@ export class EngagementFlowSubsystem implements Persistable {
    * Behavior:
    *   1. Resolve the agent — `opts.agentId` wins; else
    *      `engagement.preferredAgentId`; else `engagement.boundAgentIds[0]`.
-   *   2. Splice the assembled PrepData blob into the prompt on Turn #1
-   *      (`engagement.turnIds.length === 0`). Subsequent Turns skip the
-   *      splice — context lives in the provider's session (Claude) or
-   *      in the Turn history readable from `agents.turns.list(...)`
-   *      (stateless providers).
+   *   2. Splice the assembled PrepData blob into the prompt on **every**
+   *      Turn whose engagement has prep data. The preamble is rendered
+   *      as a pure function of PrepData (no timestamps, deterministic
+   *      ordering) so the static prefix is byte-identical across
+   *      Turns — which lets local llama.cpp KV caches reuse the
+   *      preamble's attention state on Turn #2+. Stateful providers
+   *      (bridge) absorb the duplicate cheaply or mark it cacheable
+   *      via their own prompt-cache markers.
+   *      See `runtime.library.get('blur-inference-paradigm')` §11.
    *   3. `agents.sendMessage(agentId, { text, by })` — opens the Turn
    *      as a side-effect of dispatch.
    *   4. `engagements.addTurn({ engagementId, turnId })` — links the
@@ -552,10 +556,28 @@ export class EngagementFlowSubsystem implements Persistable {
       throw new Error(`engagementFlow.dispatchTurn: unknown engagement '${engagementId}'`);
     }
 
-    // PrepData splice on Turn #1. After this, context lives in the
-    // provider session (Claude) or in the Turn record history (Together).
-    const isFirstTurn = (engagement.turnIds?.length ?? 0) === 0;
-    const prepData = isFirstTurn ? this.prepDataByEng.get(engagementId) ?? null : null;
+    // PrepData splice on EVERY Turn (not just Turn #1).
+    //
+    // The original gate (`isFirstTurn`) was designed for stateful
+    // providers like Claude/bridge, where prior context lives in the
+    // bridge session and re-sending it would be a paid duplicate.
+    // For stateless local providers (Ollama, vLLM) it is **actively
+    // harmful**: Turn #1 warms llama.cpp's KV cache for the prep
+    // preamble; Turn #2 sends a different prefix (just the raw user
+    // text) → cache miss → full re-tokenization on every subsequent
+    // Turn.
+    //
+    // The fix is the opposite of the old gate: send the same
+    // byte-identical preamble at the top of every dispatch.
+    // `formatPrepPreamble` is now a pure function of PrepData, so the
+    // serialized block is byte-stable across Turns (no timestamps).
+    // Stateful providers (bridge) absorb the duplicate cheaply; their
+    // own per-provider cache markers (prompt-cache-2024-09 etc.) can
+    // mark the static block as cacheable if needed. Stateless local
+    // providers get the warm-cache TTFT win.
+    //
+    // See `runtime.library.get('blur-inference-paradigm')` §11.
+    const prepData = this.prepDataByEng.get(engagementId) ?? null;
     const finalText =
       prepData !== null
         ? formatPrepPreamble(engagementId, prepData) + '\n\n──\n\n' + opts.text
@@ -1087,14 +1109,30 @@ function clonePrepData(p: PrepData): PrepData {
 
 /**
  * Render PrepData into a compact human-readable preamble that ships as
- * the first chunk of the Turn #1 prompt. Markdown-flavored prose; Claude
- * and Together both read this well. Kept terse — large structured data
- * (full charter, recursive hierarchy) is omitted; the model can ask
- * follow-up questions via runtime primitives if it wants more.
+ * the static prefix of every Turn's prompt. Markdown-flavored prose;
+ * Claude / Together / local Ollama all read it well. Kept terse —
+ * large structured data (full charter, recursive hierarchy) is omitted;
+ * the model can ask follow-up questions via runtime primitives if it
+ * wants more.
+ *
+ * **Byte-stable across Turns** — this function is a pure function of
+ * its inputs. No `Date.now()`, no `prep.assembledAt`, no wall-clock
+ * state in the rendered output. The rationale lives in
+ * `runtime.library.get('blur-inference-paradigm')` §11:
+ *
+ *   Local inference engines (llama.cpp via Ollama, vLLM, etc.) use
+ *   linear KV caching keyed on the byte-exact prefix. Any drift in
+ *   the static block — a changed timestamp, a reordered field —
+ *   invalidates the cache for every token below it. Keeping the
+ *   preamble deterministic is what lets Turn #2 hit a warm cache from
+ *   Turn #1's prep work.
+ *
+ * `assembledAt` is retained on the PrepData record (audit / debug
+ * surface) — it just doesn't appear in the rendered block.
  */
 function formatPrepPreamble(engagementId: string, prep: PrepData): string {
   const lines: string[] = [];
-  lines.push(`[Engagement context — assembled ${prep.assembledAt}]`);
+  lines.push(`[Engagement context]`);
   lines.push('');
   lines.push(`engagement: ${engagementId}`);
   lines.push('');
