@@ -53,11 +53,27 @@ import type {
   WorkItem,
   WorkItemStatus,
 } from './scheduler-types';
+import {
+  TICKET_TTL_MS,
+  TICKET_HISTORY_CAP_PER_ENG,
+  type ListTicketsOpts,
+  type RequestOverrides,
+  type RequestTurnOpts,
+  type RequestTurnResult,
+  type Ticket,
+  type TicketHistory,
+  type TicketHistoryEvent,
+  type TicketTerminalReason,
+} from './ticket-types';
 
 interface Snapshot {
   schemaVersion: number;
   workItems: WorkItem[];
   routingPolicy: RoutingPolicyEntry[];
+  // Decision 34 — only active tickets are persisted; history is rebuilt
+  // from audit on restart (or lost on fresh boots, by design — terminal
+  // tickets are read-only artifacts that don't drive behavior).
+  activeTickets?: Ticket[];
 }
 
 const SCHEMA_VERSION = 1;
@@ -98,6 +114,24 @@ export class SchedulerSubsystem implements Persistable {
   /** LRU tracking: agentId → last assignment timestamp (ms). */
   private lastAssignedAtByAgent = new Map<string, number>();
 
+  // -------------------------------------------------------------------
+  // Decision 34 — ticket store
+  // -------------------------------------------------------------------
+  /** Active tickets keyed by ticketId (issued | active). */
+  private activeByTicketId = new Map<string, Ticket>();
+  /**
+   * Terminal tickets keyed by ticketId. Capped per-engagement; ring
+   * eviction on overflow. Persisted only for active tickets — history
+   * is in-memory only.
+   */
+  private historyByTicketId = new Map<string, Ticket>();
+  /** Per-ticket lifecycle event log. Same retention as historyByTicketId. */
+  private historyEventsByTicketId = new Map<string, TicketHistoryEvent[]>();
+  /** Per-engagement FIFO of historical ticket ids for ring eviction. */
+  private historyTicketIdsByEngagement = new Map<string, string[]>();
+
+  private auditUnsubs: Array<() => void> = [];
+
   constructor(public readonly runtime: BlurAIRuntime) {}
 
   // ===================================================================
@@ -108,6 +142,18 @@ export class SchedulerSubsystem implements Persistable {
     if (this.tickTimer) return;
     this.tickTimer = setInterval(() => this.tick(), SCHEDULER_TICK_MS);
     if (typeof this.tickTimer.unref === 'function') this.tickTimer.unref();
+
+    // Decision 34 — subscribe to Turn lifecycle so tickets auto-release
+    // on turn completion / error. Sweep handles TTL-expiry separately.
+    const audit = (this.runtime as { audit?: { subscribe?: (p: string, h: (e: unknown) => void) => () => void } }).audit;
+    if (audit?.subscribe) {
+      this.auditUnsubs.push(
+        audit.subscribe('agents.turn.completed', (e) => this.onTurnTerminal(e, 'completed')),
+      );
+      this.auditUnsubs.push(
+        audit.subscribe('agents.turn.errored', (e) => this.onTurnTerminal(e, 'cancelled')),
+      );
+    }
   }
 
   stop(): void {
@@ -115,6 +161,10 @@ export class SchedulerSubsystem implements Persistable {
       clearInterval(this.tickTimer);
       this.tickTimer = null;
     }
+    for (const u of this.auditUnsubs) {
+      try { u(); } catch { /* swallow */ }
+    }
+    this.auditUnsubs = [];
   }
 
   setAlgorithm(algorithm: SchedulerAlgorithm): void {
@@ -353,6 +403,7 @@ export class SchedulerSubsystem implements Persistable {
       schemaVersion: SCHEMA_VERSION,
       workItems: [...this.workItems.values()],
       routingPolicy: [...this.routingPolicy.values()],
+      activeTickets: [...this.activeByTicketId.values()],
     };
     return JSON.stringify(snap);
   }
@@ -371,6 +422,7 @@ export class SchedulerSubsystem implements Persistable {
     if (!parsed || parsed.schemaVersion !== SCHEMA_VERSION) return;
     this.workItems.clear();
     this.routingPolicy.clear();
+    this.activeByTicketId.clear();
     if (Array.isArray(parsed.workItems)) {
       for (const item of parsed.workItems) {
         if (item && typeof item.id === 'string') this.workItems.set(item.id, item);
@@ -379,6 +431,11 @@ export class SchedulerSubsystem implements Persistable {
     if (Array.isArray(parsed.routingPolicy)) {
       for (const e of parsed.routingPolicy) {
         if (e && typeof e.kind === 'string') this.routingPolicy.set(e.kind, e);
+      }
+    }
+    if (Array.isArray(parsed.activeTickets)) {
+      for (const t of parsed.activeTickets) {
+        if (t && typeof t.ticketId === 'string') this.activeByTicketId.set(t.ticketId, t);
       }
     }
     // Restore is not a mutation.
@@ -393,6 +450,311 @@ export class SchedulerSubsystem implements Persistable {
     const d = this._dirty;
     this._dirty = false;
     return d;
+  }
+
+  // ===================================================================
+  // Tickets (Decision 34)
+  // ===================================================================
+
+  /**
+   * Request a Turn against an Engagement. Issues a ticket, dispatches
+   * via `agents.sendMessage(agentId, { text, ticketId, by })`, stamps
+   * the ticket as active, and returns the four identifiers the caller
+   * needs to follow the dispatch:
+   *
+   *   { ticketId, agentId, turnId, replyHandle }
+   *
+   * Agent resolution: `opts.preferredAgentId` wins (when present + active);
+   * otherwise picks `engagement.boundAgentIds[0]`; otherwise throws (the
+   * caller must run engagementFlow.runSchedulerLease first to seed a
+   * bound agent — or supply a preferredAgentId).
+   *
+   * Ticket TTL defaults to `TICKET_TTL_MS` (5 min). Expired tickets are
+   * released on the next scheduler tick.
+   */
+  async requestTurn(opts: RequestTurnOpts): Promise<RequestTurnResult> {
+    if (!opts || typeof opts.engagementId !== 'string' || !opts.engagementId) {
+      throw new Error('scheduler.requestTurn: opts.engagementId required');
+    }
+    if (typeof opts.prompt !== 'string' || !opts.prompt) {
+      throw new Error('scheduler.requestTurn: opts.prompt required (non-empty)');
+    }
+    if (!this.agentsRef) {
+      throw new Error('scheduler.requestTurn: agents subsystem not wired');
+    }
+
+    // Resolve engagement + pick agent.
+    const engagementsApi = this.resolveEngagementsApi();
+    const engagement = engagementsApi?.get
+      ? (engagementsApi.get(opts.engagementId) as
+          | { id: string; boundAgentIds?: string[]; preferredAgentId?: string }
+          | null)
+      : null;
+    if (!engagement) {
+      throw new Error(`scheduler.requestTurn: unknown engagement '${opts.engagementId}'`);
+    }
+
+    const candidateAgentId =
+      opts.preferredAgentId ??
+      engagement.preferredAgentId ??
+      engagement.boundAgentIds?.[0] ??
+      null;
+    if (!candidateAgentId) {
+      throw new Error(
+        `scheduler.requestTurn: no agent bound to engagement '${opts.engagementId}'. ` +
+          'Run engagementFlow.runSchedulerLease first or supply opts.preferredAgentId.',
+      );
+    }
+
+    const agent = this.agentsRef.get(candidateAgentId);
+    if (!agent) {
+      throw new Error(
+        `scheduler.requestTurn: agentId '${candidateAgentId}' not found in agents registry`,
+      );
+    }
+    if (agent.status !== 'active') {
+      throw new Error(
+        `scheduler.requestTurn: agentId '${candidateAgentId}' is '${agent.status}'; cannot dispatch`,
+      );
+    }
+
+    // Decision 36 step 1 — capture caller-supplied routing overrides
+    // onto the ticket and audit payload. Recorded only; v0 routing
+    // (above) still uses the boundAgentIds[0]/preferredAgentId path.
+    // Later D36 steps will consult these for AI-Choose / Activity-Table
+    // -driven dispatch.
+    const requestOverrides: RequestOverrides | undefined =
+      opts.pin !== undefined || opts.activityTable !== undefined || opts.complexity !== undefined
+        ? {
+            ...(opts.pin !== undefined ? { pin: opts.pin } : {}),
+            ...(opts.activityTable !== undefined ? { activityTable: opts.activityTable } : {}),
+            ...(opts.complexity !== undefined ? { complexity: opts.complexity } : {}),
+          }
+        : undefined;
+
+    // Issue the ticket.
+    const ticket = this.issueTicket({
+      engagementId: opts.engagementId,
+      agentId: candidateAgentId,
+      providerKind: agent.provider?.kind ?? 'unknown',
+      outcome: opts.outcome,
+      by: opts.by,
+      ttlMs: opts.ttlMs ?? TICKET_TTL_MS,
+      requestOverrides,
+    });
+
+    // Dispatch through the AgentsSubsystem. sendMessage threads the
+    // ticketId through to the Turn record (Decision 34).
+    let sent: { replyHandle: string; turnId?: string };
+    try {
+      sent = await this.agentsRef.sendMessage(candidateAgentId, {
+        text: opts.prompt,
+        by: opts.by ?? 'scheduler.requestTurn',
+        ticketId: ticket.ticketId,
+      });
+    } catch (err: unknown) {
+      // Dispatch failed → release the ticket immediately.
+      this.releaseTicket(ticket.ticketId, 'cancelled');
+      throw err;
+    }
+
+    const turnId = sent.turnId ?? `tur_unstamped_${Date.now()}`;
+    this.markTicketActive(ticket.ticketId, turnId);
+
+    return {
+      ticketId: ticket.ticketId,
+      agentId: candidateAgentId,
+      turnId,
+      replyHandle: sent.replyHandle,
+    };
+  }
+
+  /**
+   * Release a ticket. Idempotent — releasing an already-terminal ticket
+   * is a no-op. Reason defaults to 'cancelled' when callers don't
+   * specify; the Turn-completion subscriber uses 'completed', the TTL
+   * sweep uses 'expired'.
+   */
+  releaseTicket(ticketId: string, reason: TicketTerminalReason = 'cancelled'): void {
+    const ticket = this.activeByTicketId.get(ticketId);
+    if (!ticket) return;
+    ticket.status = reason;
+    ticket.endedAt = new Date().toISOString();
+    ticket.releaseReason = reason;
+    this.activeByTicketId.delete(ticketId);
+    this.recordHistoryEvent(ticketId, reason);
+    this.archiveToHistory(ticket);
+    this._dirty = true;
+    this.emit('agents.scheduler.ticket-released', `item:agents.scheduler.tickets[${ticketId}]`, {
+      ticketId,
+      engagementId: ticket.engagementId,
+      agentId: ticket.agentId,
+      turnId: ticket.turnId,
+      reason,
+    });
+  }
+
+  /**
+   * List tickets, optional filters. By default returns active only;
+   * pass `includeHistory: true` to merge terminal tickets in.
+   */
+  listTickets(opts: ListTicketsOpts = {}): Ticket[] {
+    const wantStatuses = opts.status
+      ? Array.isArray(opts.status)
+        ? new Set(opts.status)
+        : new Set([opts.status])
+      : null;
+
+    let pool: Ticket[] = [...this.activeByTicketId.values()];
+    if (opts.includeHistory) {
+      pool = pool.concat([...this.historyByTicketId.values()]);
+    }
+
+    let list = pool;
+    if (opts.engagementId) list = list.filter(t => t.engagementId === opts.engagementId);
+    if (opts.agentId) list = list.filter(t => t.agentId === opts.agentId);
+    if (opts.outcome) list = list.filter(t => t.outcome === opts.outcome);
+    if (wantStatuses) list = list.filter(t => wantStatuses.has(t.status));
+
+    // Newest first.
+    list.sort((a, b) => (a.issuedAt < b.issuedAt ? 1 : -1));
+    if (typeof opts.limit === 'number') list = list.slice(0, opts.limit);
+    return list.map(cloneTicket);
+  }
+
+  /**
+   * Lifecycle history for one ticket. Returns null when the ticket has
+   * never existed (or was evicted from the per-engagement ring).
+   */
+  ticketHistory(ticketId: string): TicketHistory | null {
+    const events = this.historyEventsByTicketId.get(ticketId);
+    const terminal = this.historyByTicketId.get(ticketId);
+    const active = this.activeByTicketId.get(ticketId);
+    const ticket = terminal ?? active;
+    if (!ticket) return null;
+    return {
+      ticketId,
+      events: (events ?? []).map(e => ({ ...e })),
+      ticket: cloneTicket(ticket),
+    };
+  }
+
+  // -------------------------------------------------------------------
+  // Ticket internals
+  // -------------------------------------------------------------------
+
+  private issueTicket(opts: {
+    engagementId: string;
+    agentId: string;
+    providerKind: string;
+    outcome?: string;
+    by?: string;
+    ttlMs: number;
+    /** Decision 36 step 1 — recorded only in v0. */
+    requestOverrides?: RequestOverrides;
+  }): Ticket {
+    const ticketId = `tkt_${randomUUID()}`;
+    const now = new Date();
+    const ticket: Ticket = {
+      ticketId,
+      engagementId: opts.engagementId,
+      agentId: opts.agentId,
+      providerKind: opts.providerKind,
+      outcome: opts.outcome,
+      status: 'issued',
+      issuedAt: now.toISOString(),
+      expiresAt: new Date(now.getTime() + opts.ttlMs).toISOString(),
+      by: opts.by,
+      ...(opts.requestOverrides ? { requestOverrides: opts.requestOverrides } : {}),
+    };
+    this.activeByTicketId.set(ticketId, ticket);
+    this.recordHistoryEvent(ticketId, 'issued');
+    this._dirty = true;
+    this.emit('agents.scheduler.ticket-issued', `item:agents.scheduler.tickets[${ticketId}]`, {
+      ticketId,
+      engagementId: ticket.engagementId,
+      agentId: ticket.agentId,
+      providerKind: ticket.providerKind,
+      outcome: ticket.outcome,
+      expiresAt: ticket.expiresAt,
+      by: opts.by,
+      // Decision 36 step 1 — include the snapshot in audit so dispatch
+      // lineage is reproducible from the audit log alone.
+      ...(opts.requestOverrides ? { requestOverrides: opts.requestOverrides } : {}),
+    });
+    return ticket;
+  }
+
+  private markTicketActive(ticketId: string, turnId: string): void {
+    const ticket = this.activeByTicketId.get(ticketId);
+    if (!ticket) return;
+    if (ticket.status !== 'issued') return;
+    ticket.status = 'active';
+    ticket.turnId = turnId;
+    ticket.startedAt = new Date().toISOString();
+    this.recordHistoryEvent(ticketId, 'used', `turnId=${turnId}`);
+    this._dirty = true;
+  }
+
+  /**
+   * Audit subscriber callback: when an `agents.turn.completed` or
+   * `agents.turn.errored` fires, find the matching active ticket (via
+   * `data.turnId` or `data.ticketId`) and release it.
+   */
+  private onTurnTerminal(e: unknown, reason: TicketTerminalReason): void {
+    const evt = e as { data?: { turnId?: string; ticketId?: string } } | null;
+    const turnId = evt?.data?.turnId;
+    const stampedTicketId = evt?.data?.ticketId;
+    if (!turnId && !stampedTicketId) return;
+    // Prefer ticketId from the audit payload when present.
+    let ticket: Ticket | undefined;
+    if (stampedTicketId) ticket = this.activeByTicketId.get(stampedTicketId);
+    if (!ticket && turnId) {
+      for (const t of this.activeByTicketId.values()) {
+        if (t.turnId === turnId) { ticket = t; break; }
+      }
+    }
+    if (!ticket) return;
+    this.releaseTicket(ticket.ticketId, reason);
+  }
+
+  /** TTL sweep — called from the existing `tick()` loop. */
+  private sweepTickets(): void {
+    const now = Date.now();
+    const expired: string[] = [];
+    for (const t of this.activeByTicketId.values()) {
+      if (new Date(t.expiresAt).getTime() <= now) expired.push(t.ticketId);
+    }
+    for (const ticketId of expired) {
+      this.releaseTicket(ticketId, 'expired');
+    }
+  }
+
+  private recordHistoryEvent(ticketId: string, kind: TicketHistoryEvent['kind'], detail?: string): void {
+    const events = this.historyEventsByTicketId.get(ticketId) ?? [];
+    events.push({ at: new Date().toISOString(), kind, detail });
+    this.historyEventsByTicketId.set(ticketId, events);
+  }
+
+  private archiveToHistory(ticket: Ticket): void {
+    this.historyByTicketId.set(ticket.ticketId, ticket);
+    const ring = this.historyTicketIdsByEngagement.get(ticket.engagementId) ?? [];
+    ring.push(ticket.ticketId);
+    while (ring.length > TICKET_HISTORY_CAP_PER_ENG) {
+      const evicted = ring.shift();
+      if (evicted) {
+        this.historyByTicketId.delete(evicted);
+        this.historyEventsByTicketId.delete(evicted);
+      }
+    }
+    this.historyTicketIdsByEngagement.set(ticket.engagementId, ring);
+  }
+
+  private resolveEngagementsApi(): { get?: (id: string) => unknown } | null {
+    const rt = this.runtime as { extensions?: { get(name: string): unknown } };
+    const exts = rt.extensions;
+    if (!exts || typeof exts.get !== 'function') return null;
+    return (exts.get('engagements') as { get?: (id: string) => unknown } | null) ?? null;
   }
 
   // ===================================================================
@@ -490,6 +852,12 @@ export class SchedulerSubsystem implements Persistable {
       // Tick errors must not crash the timer.
       console.warn(`[scheduler] tick error: ${(e as Error)?.message ?? String(e)}`);
     }
+    // Decision 34 — sweep expired tickets every tick.
+    try {
+      this.sweepTickets();
+    } catch (e) {
+      console.warn(`[scheduler] ticket sweep error: ${(e as Error)?.message ?? String(e)}`);
+    }
   }
 
   /** Agents currently 'assigned' or 'running' to a WorkItem. */
@@ -516,6 +884,10 @@ export class SchedulerSubsystem implements Persistable {
       /* swallow */
     }
   }
+}
+
+function cloneTicket(t: Ticket): Ticket {
+  return { ...t };
 }
 
 function cloneWorkItem(w: WorkItem): WorkItem {
