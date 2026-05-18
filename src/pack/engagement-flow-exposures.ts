@@ -110,6 +110,16 @@ export const engagementFlowExposures: MethodExposure[] = [
   },
   {
     objectPath: 'engagementFlow',
+    method: 'inspectScriptLoopState',
+    primitivePath: 'engagementFlow.inspectScriptLoopState',
+    signature: '(): { iterationCounts: Record<string, number>; turnToEngagementSize: number; turnToEngagementSample: Array<{turnId, engagementId}>; historyAppendActivities: string[] }',
+    description:
+      'Diagnostic — read the script-loop subscriber\'s in-memory state. `turnToEngagement` is the turnId→engagementId index populated by `engagements.turn-added`; it\'s an O(1) cache for the per-Turn-completion handler. `iterationCounts` tracks per-engagement iteration depth within a script-loop chain. Note: "live" engagement state is NOT cached here — `engagement.status` is checked on demand against the durable store, no shadow set.',
+    sideEffect: 'read',
+    category: 'support',
+  },
+  {
+    objectPath: 'engagementFlow',
     method: 'getTurnStats',
     primitivePath: 'engagementFlow.getTurnStats',
     signature: '(turnId: string): TurnStats | null',

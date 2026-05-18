@@ -88,7 +88,7 @@ interface TurnRecordView {
  * iteration of a script-loop chain is its own Turn in v1, so each
  * iteration gets its own TurnStats entry). Populated when the Turn
  * completes; survives in-memory until the engagement leaves
- * liveEngagements or the global cap rolls oldest entries off.
+ * the global cap rolls oldest entries off.
  */
 export interface TurnStats {
   /** The Turn this stats record belongs to. */
@@ -176,9 +176,6 @@ export class EngagementFlowSubsystem implements Persistable {
    */
   private outputsByEng = new Map<string, LinkedOutput[]>();
 
-  /** Active engagements we've seen `opened` for and not yet `completed`. */
-  private liveEngagements = new Set<string>();
-
   // -------------------------------------------------------------------------
   // Script-loop state (state-advancement-loop §1).
   //
@@ -220,8 +217,8 @@ export class EngagementFlowSubsystem implements Persistable {
   /**
    * Per-Turn statistics, keyed by turnId. Populated by the script-loop
    * subscriber as each Turn completes. Survives until the engagement
-   * exits liveEngagements OR the cap (TURN_STATS_CAP) is hit, after
-   * which oldest entries are dropped.
+   * the cap (TURN_STATS_CAP) is hit, after which oldest entries are
+   * dropped.
    *
    * Surfaced via `engagementFlow.getTurnStats(turnId)` and
    * `engagementFlow.getEngagementStats(engId)`. The audit log is the
@@ -295,6 +292,59 @@ export class EngagementFlowSubsystem implements Persistable {
         void this.onTurnCompletedForScriptLoop(e);
       }),
     );
+
+    // Rebuild the turnId→engagementId index from the durable store so
+    // pack reloads don't drop the cache. The script-loop subscriber
+    // consults this index when `agents.turn.completed` fires; without
+    // rehydration, Turns whose `engagements.turn-added` audit fired
+    // during a prior subsystem lifetime would be invisible. Active
+    // engagement status itself is NOT cached — checked on demand.
+    void this.rehydrateScriptLoopState();
+  }
+
+  /**
+   * Rebuild the `turnToEngagement` index from the durable engagement
+   * store. The index maps `turnId → engagementId` for O(1) lookup when
+   * `agents.turn.completed` audits arrive — there's no
+   * `turn.engagementId` field on the Turn record, so without this
+   * index we'd have to iterate all engagements per Turn.
+   *
+   * Pack reloads drop this in-memory map; on start() we rebuild from
+   * `engagements.list({status:'active'})`. Live audits
+   * (`engagements.turn-added`) keep it current after that.
+   *
+   * Notes:
+   *   - "Active" engagement state is NOT cached separately —
+   *     `engagement.status === 'active'` is checked on demand in the
+   *     script-loop handler. Single source of truth, no rehydration
+   *     ceremony, no drift.
+   *   - Uses the in-process extension shim (`resolveEngagements`)
+   *     rather than the script-side `runtime.engagements.*` surface —
+   *     subsystem code runs in-host, not via the script isolate.
+   */
+  private async rehydrateScriptLoopState(): Promise<void> {
+    try {
+      const api = this.resolveEngagements() as
+        | {
+            list?: (opts: { status?: string | string[]; limit?: number }) => unknown;
+          }
+        | null;
+      if (!api?.list) return;
+      const raw = await Promise.resolve(api.list({ status: 'active', limit: 500 }));
+      const active = (Array.isArray(raw) ? raw : []) as Array<{
+        id: string;
+        turnIds?: string[];
+      }>;
+      for (const e of active) {
+        if (!e?.id) continue;
+        for (const tid of e.turnIds ?? []) {
+          this.turnToEngagement.set(tid, e.id);
+        }
+      }
+    } catch {
+      /* swallow — rehydration is best-effort; missing entries will be
+         picked up by the next live `engagements.turn-added` audit */
+    }
   }
 
   stop(): void {
@@ -898,7 +948,15 @@ export class EngagementFlowSubsystem implements Persistable {
       const engagementId = this.turnToEngagement.get(turnId);
       if (!engagementId) return;
       recordedEngagementId = engagementId;
-      if (!this.liveEngagements.has(engagementId)) return;
+
+      // "Live" is just `engagement.status === 'active'` — querying the
+      // durable store on demand is the single source of truth. Avoids
+      // a redundant in-memory Set that drifts on pack reload and forces
+      // rehydration ceremony.
+      const liveCheck = (await this.resolveEngagement(engagementId)) as
+        | { status?: string }
+        | null;
+      if (!liveCheck || liveCheck.status !== 'active') return;
 
       // Fetch the Turn record to read assembledText + timing fields.
       const turn = await this.fetchTurn(turnId);
@@ -1095,6 +1153,27 @@ export class EngagementFlowSubsystem implements Persistable {
   }
 
   /**
+   * Diagnostic primitive exposing the script-loop's in-memory state.
+   * Helps debug "why isn't the loop firing for this Turn?" by surfacing
+   * the maps the subscriber consults. Read-only.
+   */
+  inspectScriptLoopState(): {
+    iterationCounts: Record<string, number>;
+    turnToEngagementSize: number;
+    turnToEngagementSample: Array<{ turnId: string; engagementId: string }>;
+    historyAppendActivities: string[];
+  } {
+    return {
+      iterationCounts: Object.fromEntries(this.scriptLoopIterations),
+      turnToEngagementSize: this.turnToEngagement.size,
+      turnToEngagementSample: [...this.turnToEngagement.entries()]
+        .slice(-10)
+        .map(([turnId, engagementId]) => ({ turnId, engagementId })),
+      historyAppendActivities: [...EngagementFlowSubsystem.HISTORY_APPEND_ACTIVITIES],
+    };
+  }
+
+  /**
    * Aggregate the in-memory TurnStats for an engagement. Returns recent-
    * first ordering, capped by `opts.limit` (default 50).
    */
@@ -1240,7 +1319,6 @@ export class EngagementFlowSubsystem implements Persistable {
   private async onEngagementOpened(e: SemanticEventLike): Promise<void> {
     const engagementId = e.data?.engagementId as string | undefined;
     if (!engagementId) return;
-    this.liveEngagements.add(engagementId);
 
     const shape = e.data?.shape as string | undefined;
     const activityId = e.data?.activityId as string | undefined;
@@ -1267,8 +1345,6 @@ export class EngagementFlowSubsystem implements Persistable {
       await this.runLinker(engagementId);
     } catch {
       /* swallow — linker failures must not crash the audit loop */
-    } finally {
-      this.liveEngagements.delete(engagementId);
     }
   }
 
@@ -1285,7 +1361,14 @@ export class EngagementFlowSubsystem implements Persistable {
     if (!engagementId && typeof e.data?.engagementId === 'string') {
       engagementId = e.data.engagementId as string;
     }
-    if (!engagementId || !this.liveEngagements.has(engagementId)) return;
+    if (!engagementId) return;
+    // Only accumulate outputs for engagements that are still active.
+    // Status check is against the durable store (single source of truth).
+    const eng = this.resolveEngagements()?.get?.(engagementId) as
+      | { status?: string }
+      | null
+      | undefined;
+    if (!eng || eng.status !== 'active') return;
 
     const candidate = classifyOutput(e);
     if (!candidate) return;
