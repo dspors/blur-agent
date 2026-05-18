@@ -118,19 +118,25 @@ export function renderTagResult(
 /**
  * Serialize a script's return value for inclusion in a `<b:s-result>`
  * body. Rules:
- *   undefined → empty string
- *   string    → as-is
- *   number / boolean / null → JSON.stringify
+ *   undefined → '(undefined — script returned no value)'
+ *   null      → 'null'  (JSON-encoded)
+ *   string    → as-is, with empty-string disambiguation
+ *   number / boolean → JSON.stringify
  *   object / array → JSON.stringify(value, null, 2) with sorted keys
+ *
+ * Why disambiguate undefined / empty-string:
+ *   v1 returned '' for undefined → the `<b:s-result>` body was empty →
+ *   small models (llama3.1:8b observed) hallucinated that the script
+ *   errored. Explicit "(undefined — …)" makes the outcome unambiguous
+ *   and removes a class of model confusion.
  */
 export function stringifyScriptReturn(value: unknown): string {
-  if (value === undefined) return '';
-  if (typeof value === 'string') return value;
-  if (
-    value === null ||
-    typeof value === 'number' ||
-    typeof value === 'boolean'
-  ) {
+  if (value === undefined) return '(undefined — script returned no value)';
+  if (value === null) return 'null';
+  if (typeof value === 'string') {
+    return value === '' ? '(empty string)' : value;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
     return JSON.stringify(value);
   }
   // Object / array: stable serialization via sorted-key replacer.
