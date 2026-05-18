@@ -42,14 +42,19 @@ const RESULT_BODY_CAP_BYTES = 8192;
  * Extract `<b:*>` tags from a model reply.
  *
  * - Only `<b:s>...</b:s>` recognized in v1 (others are reserved).
- * - Tags inside triple-backtick fenced code blocks are skipped (model
- *   may display tag-shaped text as content).
+ * - Tags are executed **regardless of whether they're inside ``` fences**.
+ *   The original design treated fenced tags as content-only ("the model
+ *   wants to display tag-shaped text without running it"), but chat-
+ *   trained models (llama3.1, etc.) wrap code in fences by markdown
+ *   convention — the "common case" of fenced tags IS execution intent.
+ *   If we ever need a display-only escape, we'll teach the model a
+ *   different one (HTML-style entity encoding or a `lang=blur-display`
+ *   fence marker).
  * - Self-closing forms (`<b:s/>`) are not recognized in v1.
  * - Order is source order (left-to-right, top-to-bottom).
  */
 export function parseBTags(source: string): BTag[] {
   const tags: BTag[] = [];
-  const fences = findFenceRanges(source);
 
   // Match: <b:s ...>body</b:s>
   // Non-greedy body match; supports nested unrelated content but not
@@ -58,14 +63,12 @@ export function parseBTags(source: string): BTag[] {
   let m: RegExpExecArray | null;
   let pos = 1;
   while ((m = re.exec(source)) !== null) {
-    const startOffset = m.index;
-    if (insideFence(startOffset, fences)) continue;
     tags.push({
       position: pos++,
       kind: 'b:s',
       attrs: parseAttrs(m[1] ?? ''),
       body: m[2] ?? '',
-      startOffset,
+      startOffset: m.index,
       endOffset: m.index + m[0].length,
     });
   }
@@ -86,23 +89,6 @@ function parseAttrs(attrString: string): Record<string, string> {
     out[m[1]!] = m[2] ?? m[3] ?? m[4] ?? '';
   }
   return out;
-}
-
-function findFenceRanges(s: string): Array<[number, number]> {
-  const ranges: Array<[number, number]> = [];
-  const re = /```[\s\S]*?```/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(s)) !== null) {
-    ranges.push([m.index, m.index + m[0].length]);
-  }
-  return ranges;
-}
-
-function insideFence(offset: number, ranges: Array<[number, number]>): boolean {
-  for (const [start, end] of ranges) {
-    if (offset >= start && offset < end) return true;
-  }
-  return false;
 }
 
 // ============================================================================

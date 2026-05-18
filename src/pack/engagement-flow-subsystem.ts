@@ -1627,8 +1627,8 @@ const PROTOCOL_TEACHING_BLOCK = [
   '    treats your reply as the final answer to the user.',
   '  - The substrate caps the loop at 64 iterations per Turn; emit a',
   '    script-free reply when you have what you need.',
-  '  - Tags inside ``` fenced ``` code blocks are not executed; use',
-  '    fences when you want to display tag-shaped text as content.',
+  '  - You may wrap `<b:s>…</b:s>` in markdown ``` fences or not — both',
+  '    forms execute. Tags are matched anywhere in your reply.',
   '',
   'Workflow you typically follow:',
   '  1. Read whatever state matters: `<b:s>return await runtime.projects.get("…");</b:s>`',
@@ -1636,6 +1636,12 @@ const PROTOCOL_TEACHING_BLOCK = [
   '  3. Reason about the result. If you need more, emit another `<b:s>`.',
   '  4. When you have enough to answer the user, write the answer as',
   '     plain prose with **no** `<b:s>` tags. Turn ends.',
+  '',
+  'A common first-Turn move is to inspect state before answering:',
+  '  user: "what is the north star of this project?"',
+  '  you:  `<b:s>return (await runtime.projects.get("blur-project-framework")).direction?.northStar;</b:s>`',
+  '  (substrate runs it, appends the result)',
+  '  you again: "The north star is: …" (no tags — Turn ends.)',
   '',
 ].join('\n');
 
