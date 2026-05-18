@@ -69,6 +69,88 @@ interface Snapshot {
   outputsByEngagement: Array<{ engagementId: string; outputs: LinkedOutput[] }>;
 }
 
+/**
+ * Narrow projection of a Turn record's fields the script-loop handler
+ * cares about. Avoids importing the full TurnsSubsystem type and lets
+ * us read with a single shape.
+ */
+interface TurnRecordView {
+  assembledText?: string;
+  startedAt?: string;
+  endedAt?: string;
+  providerKind?: string;
+  agentId?: string;
+  request?: { text?: string };
+}
+
+/**
+ * Per-Turn timing + size statistics. One record per Turn record (each
+ * iteration of a script-loop chain is its own Turn in v1, so each
+ * iteration gets its own TurnStats entry). Populated when the Turn
+ * completes; survives in-memory until the engagement leaves
+ * liveEngagements or the global cap rolls oldest entries off.
+ */
+export interface TurnStats {
+  /** The Turn this stats record belongs to. */
+  turnId: string;
+  /** Engagement the Turn was dispatched against. */
+  engagementId: string;
+  /**
+   * Iteration index within the script-loop chain. 1 for a user-initiated
+   * Turn (or the first non-script-loop Turn after a chain ends); 2+ for
+   * follow-up Turns dispatched by the script-loop subscriber.
+   */
+  iter: number;
+  /** Role within the chain — distinguishes user prompts from script-loop continuations. */
+  loopRole: 'user-initiated' | 'script-loop';
+  /** ISO timestamps from the Turn record. */
+  startedAt: string;
+  endedAt: string;
+  /** End-to-end wall clock for this Turn (model call + chunk arrival). */
+  durationMs: number;
+  /** Bytes of the prompt sent to the provider (request.text length). */
+  prefixLen: number;
+  /** Bytes of the model's reply (assembledText length). */
+  replyLen: number;
+  /** Number of `<b:s>` tags extracted from the reply. 0 = chain-terminating. */
+  tagCount: number;
+  /** Sum of `runtime.script.run` wall-clock time for all tags this iteration. */
+  scriptExecMs: number;
+  /** Sum of `<b:s-result>` body bytes (pre-truncation) for all tags. */
+  scriptResultBytes: number;
+  /** Provider kind that handled this Turn (from Turn.providerKind). */
+  providerKind?: string;
+  /** Agent id (from Turn.agentId). */
+  agentId?: string;
+  /**
+   * `'script-free'` — reply had no tags; chain terminated naturally.
+   * `'has-tags'` — reply had tags; follow-up was dispatched.
+   * `'cap-reached'` — reply had tags but iteration cap exceeded; chain terminated.
+   * `'error'` — handler threw before completing.
+   */
+  terminationReason: 'script-free' | 'has-tags' | 'cap-reached' | 'error';
+}
+
+/**
+ * Aggregate view over an engagement's recent Turn stats. Returned by
+ * `engagementFlow.getEngagementStats`.
+ */
+export interface EngagementStats {
+  engagementId: string;
+  /** Total Turns recorded in the in-memory store. */
+  totalTurns: number;
+  /** Sum of every Turn's `<b:s>` tag count. */
+  totalTagCount: number;
+  /** Sum of every Turn's scriptExecMs. */
+  totalScriptExecMs: number;
+  /** Sum of every Turn's durationMs. */
+  totalDurationMs: number;
+  /** Mean Turn duration. */
+  meanDurationMs: number;
+  /** Most recent N Turn stats (newest first). */
+  recent: TurnStats[];
+}
+
 const SCHEMA_VERSION = 1;
 
 export class EngagementFlowSubsystem implements Persistable {
@@ -118,6 +200,20 @@ export class EngagementFlowSubsystem implements Persistable {
   private lastDispatchedPromptByEng = new Map<string, string>();
   /** Hard cap on iterations per script-loop chain. */
   private static SCRIPT_LOOP_CAP = 64;
+
+  /**
+   * Per-Turn statistics, keyed by turnId. Populated by the script-loop
+   * subscriber as each Turn completes. Survives until the engagement
+   * exits liveEngagements OR the cap (TURN_STATS_CAP) is hit, after
+   * which oldest entries are dropped.
+   *
+   * Surfaced via `engagementFlow.getTurnStats(turnId)` and
+   * `engagementFlow.getEngagementStats(engId)`. The audit log is the
+   * eventual-consistent truth; this map is the cheap O(1) view.
+   */
+  private turnStats = new Map<string, TurnStats>();
+  private turnStatsOrder: string[] = [];
+  private static TURN_STATS_CAP = 500;
 
   /**
    * In-memory tally of emitted audit events, by kind. Diagnostic only —
@@ -732,35 +828,74 @@ export class EngagementFlowSubsystem implements Persistable {
    * when a script-free reply lands.
    */
   private async onTurnCompletedForScriptLoop(event: SemanticEventLike): Promise<void> {
+    let recordedTurnId: string | null = null;
+    let recordedEngagementId: string | null = null;
     try {
       const data = event.data as { turnId?: string } | undefined;
       const turnId = data?.turnId;
       if (!turnId) return;
+      recordedTurnId = turnId;
 
       const engagementId = this.turnToEngagement.get(turnId);
       if (!engagementId) return;
+      recordedEngagementId = engagementId;
       if (!this.liveEngagements.has(engagementId)) return;
 
-      // Fetch the Turn record to read assembledText.
+      // Fetch the Turn record to read assembledText + timing fields.
       const turn = await this.fetchTurn(turnId);
       if (!turn) return;
       const replyText = typeof turn.assembledText === 'string' ? turn.assembledText : '';
-      if (!replyText) return;
 
-      const tags = parseBTags(replyText);
+      // Parse tags first so we can record stats whether or not we execute.
+      const tags = replyText ? parseBTags(replyText) : [];
+
+      // Determine iteration index — read BEFORE the cap check / decrement so
+      // we record stats for this Turn even when the cap is hit.
+      const priorIter = this.scriptLoopIterations.get(engagementId) ?? 0;
+      const iter = priorIter + 1;
+      const loopRole: TurnStats['loopRole'] = priorIter > 0 ? 'script-loop' : 'user-initiated';
+
+      // Stats scaffold — populated as we go. Stored at the end whether or not
+      // tags fire so every Turn has a record. Wall-clock comes from Turn record.
+      const startedAt = typeof turn.startedAt === 'string' ? turn.startedAt : '';
+      const endedAt = typeof turn.endedAt === 'string' ? turn.endedAt : '';
+      const durationMs =
+        startedAt && endedAt ? Math.max(0, Date.parse(endedAt) - Date.parse(startedAt)) : 0;
+      const stats: TurnStats = {
+        turnId,
+        engagementId,
+        iter,
+        loopRole,
+        startedAt,
+        endedAt,
+        durationMs,
+        prefixLen: typeof turn.request?.text === 'string' ? turn.request.text.length : 0,
+        replyLen: replyText.length,
+        tagCount: tags.length,
+        scriptExecMs: 0,
+        scriptResultBytes: 0,
+        providerKind: turn.providerKind,
+        agentId: turn.agentId,
+        terminationReason: 'script-free', // updated below
+      };
+
+      // No tags → chain terminates naturally. Record stats + bail.
       if (tags.length === 0) {
-        // Script-free reply — chain terminates naturally.
         this.scriptLoopIterations.delete(engagementId);
+        stats.terminationReason = 'script-free';
+        this.recordTurnStats(stats);
         return;
       }
 
-      // Enforce iteration cap.
-      const iter = (this.scriptLoopIterations.get(engagementId) ?? 0) + 1;
+      // Cap enforcement.
       if (iter > EngagementFlowSubsystem.SCRIPT_LOOP_CAP) {
         this.scriptLoopIterations.delete(engagementId);
+        stats.terminationReason = 'cap-reached';
+        this.recordTurnStats(stats);
         this.emit('turns.iteration-cap-reached', `item:engagements[${engagementId}]`, {
           engagementId,
           turnId,
+          iter,
           cap: EngagementFlowSubsystem.SCRIPT_LOOP_CAP,
           at: new Date().toISOString(),
         });
@@ -774,8 +909,8 @@ export class EngagementFlowSubsystem implements Persistable {
         script?: { run?: (src: string) => Promise<{ value?: unknown; ok?: boolean; error?: string }> };
       }).script?.run;
       if (typeof scriptRunner !== 'function') {
-        // No runner available — log via audit and bail. The model's reply
-        // remains as-is; user sees a Turn with unexecuted tags.
+        stats.terminationReason = 'error';
+        this.recordTurnStats(stats);
         this.emit('turns.tag-executed', `item:turns[${turnId}]`, {
           turnId,
           engagementId,
@@ -786,7 +921,6 @@ export class EngagementFlowSubsystem implements Persistable {
         return;
       }
 
-      // Execute each tag in source order; capture results.
       this.emit('turns.iteration-started', `item:engagements[${engagementId}]`, {
         engagementId,
         turnId,
@@ -795,36 +929,48 @@ export class EngagementFlowSubsystem implements Persistable {
         at: new Date().toISOString(),
       });
 
+      // Execute each tag in source order; accumulate timing + size into stats.
       const resultBlocks: string[] = [];
       for (const tag of tags) {
+        const t0 = Date.now();
         try {
           const r = await scriptRunner(tag.body);
+          const execMs = Date.now() - t0;
+          stats.scriptExecMs += execMs;
           if (r && r.ok === false) {
             const msg = r.error ?? 'script run failed';
-            resultBlocks.push(renderTagResult(tag, 'error', msg));
+            const block = renderTagResult(tag, 'error', msg);
+            resultBlocks.push(block);
             this.emit('turns.tag-executed', `item:turns[${turnId}]`, {
               turnId, engagementId, position: tag.position, kind: tag.kind,
-              status: 'error', error: msg, at: new Date().toISOString(),
+              status: 'error', error: msg, execMs, at: new Date().toISOString(),
             });
           } else {
             const body = stringifyScriptReturn(r?.value);
-            resultBlocks.push(renderTagResult(tag, 'ok', body));
+            stats.scriptResultBytes += body.length;
+            const block = renderTagResult(tag, 'ok', body);
+            resultBlocks.push(block);
             this.emit('turns.tag-executed', `item:turns[${turnId}]`, {
               turnId, engagementId, position: tag.position, kind: tag.kind,
-              status: 'ok', resultLen: body.length, at: new Date().toISOString(),
+              status: 'ok', resultLen: body.length, execMs, at: new Date().toISOString(),
             });
           }
         } catch (err) {
+          const execMs = Date.now() - t0;
+          stats.scriptExecMs += execMs;
           const msg = (err as Error)?.message ?? String(err);
           resultBlocks.push(renderTagResult(tag, 'error', msg));
           this.emit('turns.tag-executed', `item:turns[${turnId}]`, {
             turnId, engagementId, position: tag.position, kind: tag.kind,
-            status: 'error', error: msg, at: new Date().toISOString(),
+            status: 'error', error: msg, execMs, at: new Date().toISOString(),
           });
         }
       }
 
-      // Build the follow-up prompt — append-only per §9 cache rules:
+      stats.terminationReason = 'has-tags';
+      this.recordTurnStats(stats);
+
+      // Build the follow-up prompt — append-only per state-advancement-loop §9
       //   <prior dispatched prompt>
       //   <model assistant reply with tags>
       //   <b:s-result blocks>
@@ -848,6 +994,9 @@ export class EngagementFlowSubsystem implements Persistable {
         turnId,
         iter,
         tagCount: tags.length,
+        scriptExecMs: stats.scriptExecMs,
+        scriptResultBytes: stats.scriptResultBytes,
+        durationMs: stats.durationMs,
         at: new Date().toISOString(),
       });
     } catch (err) {
@@ -855,6 +1004,8 @@ export class EngagementFlowSubsystem implements Persistable {
       // Visible via the recentEmissions log if needed.
       const msg = (err as Error)?.message ?? String(err);
       this.emit('turns.iteration-completed', 'item:engagements[?]', {
+        turnId: recordedTurnId ?? undefined,
+        engagementId: recordedEngagementId ?? undefined,
         error: msg,
         at: new Date().toISOString(),
       });
@@ -862,10 +1013,60 @@ export class EngagementFlowSubsystem implements Persistable {
   }
 
   /**
+   * Insert/replace a TurnStats record. Evicts oldest when the global cap
+   * is reached (FIFO across all engagements).
+   */
+  private recordTurnStats(stats: TurnStats): void {
+    if (!this.turnStats.has(stats.turnId)) {
+      this.turnStatsOrder.push(stats.turnId);
+    }
+    this.turnStats.set(stats.turnId, stats);
+    while (this.turnStatsOrder.length > EngagementFlowSubsystem.TURN_STATS_CAP) {
+      const evict = this.turnStatsOrder.shift();
+      if (evict) this.turnStats.delete(evict);
+    }
+  }
+
+  /**
+   * Read the in-memory TurnStats record for a specific Turn. Returns null
+   * when the Turn hasn't completed yet or the entry was evicted.
+   */
+  getTurnStats(turnId: string): TurnStats | null {
+    return this.turnStats.get(turnId) ?? null;
+  }
+
+  /**
+   * Aggregate the in-memory TurnStats for an engagement. Returns recent-
+   * first ordering, capped by `opts.limit` (default 50).
+   */
+  getEngagementStats(engagementId: string, opts?: { limit?: number }): EngagementStats {
+    const limit = Math.max(1, Math.min(opts?.limit ?? 50, EngagementFlowSubsystem.TURN_STATS_CAP));
+    const all = this.turnStatsOrder
+      .map((id) => this.turnStats.get(id))
+      .filter((s): s is TurnStats => !!s && s.engagementId === engagementId);
+    const totalTurns = all.length;
+    const totalTagCount = all.reduce((a, s) => a + s.tagCount, 0);
+    const totalScriptExecMs = all.reduce((a, s) => a + s.scriptExecMs, 0);
+    const totalDurationMs = all.reduce((a, s) => a + s.durationMs, 0);
+    const meanDurationMs = totalTurns > 0 ? Math.round(totalDurationMs / totalTurns) : 0;
+    // recent-first: reverse a slice from the tail
+    const recent = all.slice(-limit).reverse();
+    return {
+      engagementId,
+      totalTurns,
+      totalTagCount,
+      totalScriptExecMs,
+      totalDurationMs,
+      meanDurationMs,
+      recent,
+    };
+  }
+
+  /**
    * Fetch a Turn record via the agents subsystem's TurnsSubsystem ref.
    * Returns null if the agents ref isn't wired or the turnId is unknown.
    */
-  private async fetchTurn(turnId: string): Promise<{ assembledText?: string } | null> {
+  private async fetchTurn(turnId: string): Promise<TurnRecordView | null> {
     if (!this.agentsRef) return null;
     const turnsRef = (this.agentsRef as unknown as {
       turnsRef?: { get?: (id: string) => unknown };
@@ -873,7 +1074,7 @@ export class EngagementFlowSubsystem implements Persistable {
     if (!turnsRef || typeof turnsRef.get !== 'function') return null;
     try {
       const t = turnsRef.get(turnId);
-      return (t as { assembledText?: string } | null) ?? null;
+      return (t as TurnRecordView | null) ?? null;
     } catch {
       return null;
     }

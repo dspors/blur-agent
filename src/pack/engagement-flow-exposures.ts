@@ -108,5 +108,27 @@ export const engagementFlowExposures: MethodExposure[] = [
     sideEffect: 'read',
     category: 'support',
   },
+  {
+    objectPath: 'engagementFlow',
+    method: 'getTurnStats',
+    primitivePath: 'engagementFlow.getTurnStats',
+    signature: '(turnId: string): TurnStats | null',
+    description:
+      'Per-Turn timing + size statistics captured by the state-advancement-loop handler (see runtime.library.get("state-advancement-loop")). Returns durationMs, prefixLen, replyLen, tagCount, scriptExecMs, scriptResultBytes, providerKind, agentId, iter, loopRole, terminationReason. Returns null when the Turn hasn\'t completed yet, was opened before this pack started, or was evicted from the in-memory cap (500 most-recent Turns retained).',
+    sideEffect: 'read',
+    example: "const s = await runtime.engagementFlow.getTurnStats('tur_abc'); // → { durationMs: 18421, scriptExecMs: 12, tagCount: 1, … }",
+    category: 'support',
+  },
+  {
+    objectPath: 'engagementFlow',
+    method: 'getEngagementStats',
+    primitivePath: 'engagementFlow.getEngagementStats',
+    signature: '(engagementId: string, opts?: { limit?: number }): EngagementStats',
+    description:
+      'Aggregate the in-memory TurnStats for an engagement. Returns { totalTurns, totalTagCount, totalScriptExecMs, totalDurationMs, meanDurationMs, recent[] }. Recent is newest-first, capped by opts.limit (default 50, max 500). Counts cover the script-loop chain for each user-initiated Turn (each iteration recorded separately in v1; loopRole field distinguishes user-initiated from script-loop continuations).',
+    sideEffect: 'read',
+    example: "const s = await runtime.engagementFlow.getEngagementStats('eng_abc', { limit: 10 });",
+    category: 'support',
+  },
   // engagementFlow.json is auto-exposed by the runtime for Persistable objects (decision 20).
 ];
