@@ -19,6 +19,7 @@
  */
 
 import type { BlurAIRuntime, Persistable } from 'blur-ai-runtime';
+import { parseBTags, renderTagResult, stringifyScriptReturn } from './b-tags';
 
 import type { AgentsSubsystem } from './agents-subsystem';
 import type { SchedulerSubsystem } from './scheduler-subsystem';
@@ -96,6 +97,28 @@ export class EngagementFlowSubsystem implements Persistable {
   /** Active engagements we've seen `opened` for and not yet `completed`. */
   private liveEngagements = new Set<string>();
 
+  // -------------------------------------------------------------------------
+  // Script-loop state (state-advancement-loop §1).
+  //
+  // The substrate's reaction to `agents.turn.completed` decides whether the
+  // model's reply contains `<b:s>` script tags. If so, each tag is executed
+  // via `runtime.script.run`, the results are appended to the prompt as
+  // `<b:s-result>` blocks, and a follow-up Turn is dispatched. The loop
+  // continues until a reply is script-free OR the per-engagement iteration
+  // cap is reached.
+  //
+  // See `runtime.library.get('state-advancement-loop')` for the full spec.
+  // -------------------------------------------------------------------------
+
+  /** Iteration count per engagement; reset when a script-free reply arrives. */
+  private scriptLoopIterations = new Map<string, number>();
+  /** Map turnId → engagementId, populated by subscribing to `engagements.turn-added`. */
+  private turnToEngagement = new Map<string, string>();
+  /** Per-engagement remembered prior-iteration prompt — feeds the next iter's prefix. */
+  private lastDispatchedPromptByEng = new Map<string, string>();
+  /** Hard cap on iterations per script-loop chain. */
+  private static SCRIPT_LOOP_CAP = 64;
+
   /**
    * In-memory tally of emitted audit events, by kind. Diagnostic only —
    * exposed via `recentEmissions()` so the smoke test (and any inspector)
@@ -146,6 +169,20 @@ export class EngagementFlowSubsystem implements Persistable {
         audit.subscribe(kind, (e) => this.onOutputCandidate(e)),
       );
     }
+
+    // Script-loop wiring — see state-advancement-loop §1, §3.
+    this.unsubs.push(
+      audit.subscribe('engagements.turn-added', (e) => {
+        const turnId = (e.data as { turnId?: string } | undefined)?.turnId;
+        const engId = (e.data as { engagementId?: string } | undefined)?.engagementId;
+        if (turnId && engId) this.turnToEngagement.set(turnId, engId);
+      }),
+    );
+    this.unsubs.push(
+      audit.subscribe('agents.turn.completed', (e) => {
+        void this.onTurnCompletedForScriptLoop(e);
+      }),
+    );
   }
 
   stop(): void {
@@ -531,6 +568,14 @@ export class EngagementFlowSubsystem implements Persistable {
         outcomes?: Record<string, string>;
       }>;
       complexity?: 'routine' | 'specialized';
+      /**
+       * Script-loop continuation flag (state-advancement-loop §1). When
+       * true, `opts.text` is already a fully-assembled prompt (prior
+       * iteration's prefix + assistant reply + tag results) and should
+       * be dispatched verbatim — no prep-preamble splice. Set by the
+       * `onTurnCompletedForScriptLoop` handler when continuing a chain.
+       */
+      skipPrepSplice?: boolean;
     } = { text: '' },
   ): Promise<{
     turnId: string;
@@ -577,11 +622,16 @@ export class EngagementFlowSubsystem implements Persistable {
     // providers get the warm-cache TTFT win.
     //
     // See `runtime.library.get('blur-inference-paradigm')` §11.
-    const prepData = this.prepDataByEng.get(engagementId) ?? null;
+    const prepData =
+      opts.skipPrepSplice ? null : this.prepDataByEng.get(engagementId) ?? null;
     const finalText =
       prepData !== null
         ? formatPrepPreamble(engagementId, prepData) + '\n\n──\n\n' + opts.text
         : opts.text;
+
+    // Remember the assembled prompt so the script-loop subscriber can
+    // append iteration results to it without re-rendering the prefix.
+    this.lastDispatchedPromptByEng.set(engagementId, finalText);
 
     // Decision 34 — route through scheduler.requestTurn when wired so
     // we get ticket-based dispatch. Falls back to direct sendMessage
@@ -659,6 +709,174 @@ export class EngagementFlowSubsystem implements Persistable {
       promptLen: finalText.length,
       prepSpliced: prepData !== null,
     };
+  }
+
+  // ===========================================================================
+  // Script-loop subscriber — state-advancement-loop §1, §3
+  // ===========================================================================
+
+  /**
+   * Fired by `audit.subscribe('agents.turn.completed', …)`. Inspects the
+   * Turn's `assembledText` for `<b:s>` tags; if any are present, executes
+   * them via `runtime.script.run`, appends the results as `<b:s-result>`
+   * blocks, and dispatches a follow-up Turn (with prep splice suppressed
+   * because the prep is already in the accumulated prompt).
+   *
+   * No-op when:
+   *   - the Turn isn't associated with a tracked engagement
+   *   - the model's reply is script-free (loop terminates naturally)
+   *   - the iteration cap is reached (emits `turns.iteration-cap-reached`)
+   *   - `runtime.script.run` is not available on the host
+   *
+   * Per-engagement iteration count tracked in `scriptLoopIterations`; reset
+   * when a script-free reply lands.
+   */
+  private async onTurnCompletedForScriptLoop(event: SemanticEventLike): Promise<void> {
+    try {
+      const data = event.data as { turnId?: string } | undefined;
+      const turnId = data?.turnId;
+      if (!turnId) return;
+
+      const engagementId = this.turnToEngagement.get(turnId);
+      if (!engagementId) return;
+      if (!this.liveEngagements.has(engagementId)) return;
+
+      // Fetch the Turn record to read assembledText.
+      const turn = await this.fetchTurn(turnId);
+      if (!turn) return;
+      const replyText = typeof turn.assembledText === 'string' ? turn.assembledText : '';
+      if (!replyText) return;
+
+      const tags = parseBTags(replyText);
+      if (tags.length === 0) {
+        // Script-free reply — chain terminates naturally.
+        this.scriptLoopIterations.delete(engagementId);
+        return;
+      }
+
+      // Enforce iteration cap.
+      const iter = (this.scriptLoopIterations.get(engagementId) ?? 0) + 1;
+      if (iter > EngagementFlowSubsystem.SCRIPT_LOOP_CAP) {
+        this.scriptLoopIterations.delete(engagementId);
+        this.emit('turns.iteration-cap-reached', `item:engagements[${engagementId}]`, {
+          engagementId,
+          turnId,
+          cap: EngagementFlowSubsystem.SCRIPT_LOOP_CAP,
+          at: new Date().toISOString(),
+        });
+        return;
+      }
+      this.scriptLoopIterations.set(engagementId, iter);
+
+      // Locate the script runner. Cast through any: BlurAIRuntime's typed
+      // surface may not declare `script.run`, but the host runtime exposes it.
+      const scriptRunner = (this.runtime as unknown as {
+        script?: { run?: (src: string) => Promise<{ value?: unknown; ok?: boolean; error?: string }> };
+      }).script?.run;
+      if (typeof scriptRunner !== 'function') {
+        // No runner available — log via audit and bail. The model's reply
+        // remains as-is; user sees a Turn with unexecuted tags.
+        this.emit('turns.tag-executed', `item:turns[${turnId}]`, {
+          turnId,
+          engagementId,
+          iter,
+          error: 'runtime.script.run unavailable on host',
+          at: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Execute each tag in source order; capture results.
+      this.emit('turns.iteration-started', `item:engagements[${engagementId}]`, {
+        engagementId,
+        turnId,
+        iter,
+        tagCount: tags.length,
+        at: new Date().toISOString(),
+      });
+
+      const resultBlocks: string[] = [];
+      for (const tag of tags) {
+        try {
+          const r = await scriptRunner(tag.body);
+          if (r && r.ok === false) {
+            const msg = r.error ?? 'script run failed';
+            resultBlocks.push(renderTagResult(tag, 'error', msg));
+            this.emit('turns.tag-executed', `item:turns[${turnId}]`, {
+              turnId, engagementId, position: tag.position, kind: tag.kind,
+              status: 'error', error: msg, at: new Date().toISOString(),
+            });
+          } else {
+            const body = stringifyScriptReturn(r?.value);
+            resultBlocks.push(renderTagResult(tag, 'ok', body));
+            this.emit('turns.tag-executed', `item:turns[${turnId}]`, {
+              turnId, engagementId, position: tag.position, kind: tag.kind,
+              status: 'ok', resultLen: body.length, at: new Date().toISOString(),
+            });
+          }
+        } catch (err) {
+          const msg = (err as Error)?.message ?? String(err);
+          resultBlocks.push(renderTagResult(tag, 'error', msg));
+          this.emit('turns.tag-executed', `item:turns[${turnId}]`, {
+            turnId, engagementId, position: tag.position, kind: tag.kind,
+            status: 'error', error: msg, at: new Date().toISOString(),
+          });
+        }
+      }
+
+      // Build the follow-up prompt — append-only per §9 cache rules:
+      //   <prior dispatched prompt>
+      //   <model assistant reply with tags>
+      //   <b:s-result blocks>
+      //
+      // The follow-up is dispatched with skipPrepSplice=true so the prep
+      // preamble (already at the top of the prior prompt) isn't duplicated.
+      const priorPrompt = this.lastDispatchedPromptByEng.get(engagementId) ?? '';
+      const followUp =
+        priorPrompt +
+        '\n\n' + replyText +
+        '\n\n' + resultBlocks.join('\n\n');
+
+      await this.dispatchTurn(engagementId, {
+        text: followUp,
+        by: 'script-loop',
+        skipPrepSplice: true,
+      });
+
+      this.emit('turns.iteration-completed', `item:engagements[${engagementId}]`, {
+        engagementId,
+        turnId,
+        iter,
+        tagCount: tags.length,
+        at: new Date().toISOString(),
+      });
+    } catch (err) {
+      // Swallow — script-loop must not crash the audit subscriber.
+      // Visible via the recentEmissions log if needed.
+      const msg = (err as Error)?.message ?? String(err);
+      this.emit('turns.iteration-completed', 'item:engagements[?]', {
+        error: msg,
+        at: new Date().toISOString(),
+      });
+    }
+  }
+
+  /**
+   * Fetch a Turn record via the agents subsystem's TurnsSubsystem ref.
+   * Returns null if the agents ref isn't wired or the turnId is unknown.
+   */
+  private async fetchTurn(turnId: string): Promise<{ assembledText?: string } | null> {
+    if (!this.agentsRef) return null;
+    const turnsRef = (this.agentsRef as unknown as {
+      turnsRef?: { get?: (id: string) => unknown };
+    }).turnsRef;
+    if (!turnsRef || typeof turnsRef.get !== 'function') return null;
+    try {
+      const t = turnsRef.get(turnId);
+      return (t as { assembledText?: string } | null) ?? null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -1132,6 +1350,11 @@ function clonePrepData(p: PrepData): PrepData {
  */
 function formatPrepPreamble(engagementId: string, prep: PrepData): string {
   const lines: string[] = [];
+  // Protocol teaching block — byte-stable across all Turns/iterations.
+  // Per state-advancement-loop §3, this section tells the model how to
+  // emit `<b:s>` tags. v1 covers scripts only; file ops are reserved.
+  lines.push(PROTOCOL_TEACHING_BLOCK);
+  lines.push('');
   lines.push(`[Engagement context]`);
   lines.push('');
   lines.push(`engagement: ${engagementId}`);
@@ -1169,6 +1392,51 @@ function formatPrepPreamble(engagementId: string, prep: PrepData): string {
 function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max - 1) + '…' : s;
 }
+
+/**
+ * Static protocol-teaching block prepended to every dispatch. Byte-stable
+ * — never includes timestamps or per-Turn drift. Cache-friendly per
+ * state-advancement-loop §9.
+ *
+ * v1 vocabulary: `<b:s>` only. File-op tags (`<b:f>`, `<b:fu>`, `<b:fc>`,
+ * `<b:fw>`) are reserved by the spec but unimplemented in v1; the model
+ * is not told about them yet to avoid confusing it with unsupported syntax.
+ */
+const PROTOCOL_TEACHING_BLOCK = [
+  '[Blur protocol — read once, apply each reply]',
+  '',
+  'You operate inside the Blur runtime. To advance project state, emit',
+  'JavaScript snippets inside `<b:s>…</b:s>` tags in your reply. The',
+  'substrate parses every `<b:s>` block, executes it via',
+  '`runtime.script.run` against the Blur runtime, and appends each',
+  'result as `<b:s-result for="$N">…</b:s-result>` (or',
+  '`<b:s-error for="$N">…</b:s-error>` on failure) to a follow-up',
+  'message. You can read those results and decide what to do next.',
+  '',
+  'Rules:',
+  '  - Each `<b:s>` body is one async TypeScript/JavaScript snippet.',
+  '    You can `await` and you can `return` a value to be reported.',
+  '    The runtime object is in scope as `runtime`. Example primitives:',
+  '    `runtime.projects.get(id)`, `runtime.tickets.list({…})`,',
+  '    `runtime.audit.recentEvents({…})`.',
+  '  - Multiple `<b:s>` blocks in one reply run in source order and',
+  '    share scope (variables declared in block 1 are visible in block 2).',
+  '    To opt out of shared scope, write `<b:s isolate="hermetic">…</b:s>`.',
+  '  - A reply with **zero** `<b:s>` tags ends the Turn. The substrate',
+  '    treats your reply as the final answer to the user.',
+  '  - The substrate caps the loop at 64 iterations per Turn; emit a',
+  '    script-free reply when you have what you need.',
+  '  - Tags inside ``` fenced ``` code blocks are not executed; use',
+  '    fences when you want to display tag-shaped text as content.',
+  '',
+  'Workflow you typically follow:',
+  '  1. Read whatever state matters: `<b:s>return await runtime.projects.get("…");</b:s>`',
+  '  2. The substrate executes it; you see a `<b:s-result>` block.',
+  '  3. Reason about the result. If you need more, emit another `<b:s>`.',
+  '  4. When you have enough to answer the user, write the answer as',
+  '     plain prose with **no** `<b:s>` tags. Turn ends.',
+  '',
+].join('\n');
 
 function cloneLinkedOutput(o: LinkedOutput): LinkedOutput {
   return { ...o };
