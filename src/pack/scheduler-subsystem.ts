@@ -57,6 +57,7 @@ import {
   TICKET_TTL_MS,
   TICKET_HISTORY_CAP_PER_ENG,
   type ListTicketsOpts,
+  type RequestOverrides,
   type RequestTurnOpts,
   type RequestTurnResult,
   type Ticket,
@@ -517,6 +518,20 @@ export class SchedulerSubsystem implements Persistable {
       );
     }
 
+    // Decision 36 step 1 — capture caller-supplied routing overrides
+    // onto the ticket and audit payload. Recorded only; v0 routing
+    // (above) still uses the boundAgentIds[0]/preferredAgentId path.
+    // Later D36 steps will consult these for AI-Choose / Activity-Table
+    // -driven dispatch.
+    const requestOverrides: RequestOverrides | undefined =
+      opts.pin !== undefined || opts.activityTable !== undefined || opts.complexity !== undefined
+        ? {
+            ...(opts.pin !== undefined ? { pin: opts.pin } : {}),
+            ...(opts.activityTable !== undefined ? { activityTable: opts.activityTable } : {}),
+            ...(opts.complexity !== undefined ? { complexity: opts.complexity } : {}),
+          }
+        : undefined;
+
     // Issue the ticket.
     const ticket = this.issueTicket({
       engagementId: opts.engagementId,
@@ -525,6 +540,7 @@ export class SchedulerSubsystem implements Persistable {
       outcome: opts.outcome,
       by: opts.by,
       ttlMs: opts.ttlMs ?? TICKET_TTL_MS,
+      requestOverrides,
     });
 
     // Dispatch through the AgentsSubsystem. sendMessage threads the
@@ -634,6 +650,8 @@ export class SchedulerSubsystem implements Persistable {
     outcome?: string;
     by?: string;
     ttlMs: number;
+    /** Decision 36 step 1 — recorded only in v0. */
+    requestOverrides?: RequestOverrides;
   }): Ticket {
     const ticketId = `tkt_${randomUUID()}`;
     const now = new Date();
@@ -647,6 +665,7 @@ export class SchedulerSubsystem implements Persistable {
       issuedAt: now.toISOString(),
       expiresAt: new Date(now.getTime() + opts.ttlMs).toISOString(),
       by: opts.by,
+      ...(opts.requestOverrides ? { requestOverrides: opts.requestOverrides } : {}),
     };
     this.activeByTicketId.set(ticketId, ticket);
     this.recordHistoryEvent(ticketId, 'issued');
@@ -659,6 +678,9 @@ export class SchedulerSubsystem implements Persistable {
       outcome: ticket.outcome,
       expiresAt: ticket.expiresAt,
       by: opts.by,
+      // Decision 36 step 1 — include the snapshot in audit so dispatch
+      // lineage is reproducible from the audit log alone.
+      ...(opts.requestOverrides ? { requestOverrides: opts.requestOverrides } : {}),
     });
     return ticket;
   }

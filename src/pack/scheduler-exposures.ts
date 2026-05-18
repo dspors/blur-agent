@@ -146,12 +146,12 @@ export const schedulerExposures: MethodExposure[] = [
     method: 'requestTurn',
     primitivePath: 'agents.scheduler.requestTurn',
     signature:
-      '(opts: { engagementId: string; prompt: string; preferredAgentId?: string; outcome?: string; by?: string; ttlMs?: number }): Promise<{ ticketId: string; agentId: string; turnId: string; replyHandle: string }>',
+      "(opts: { engagementId: string; prompt: string; preferredAgentId?: string; outcome?: string; by?: string; ttlMs?: number; pin?: string; activityTable?: Record<string, { mode: 'always'|'auto'|'ai'; default: string | null; outcomes?: Record<string, string> }>; complexity?: 'routine'|'specialized' }): Promise<{ ticketId: string; agentId: string; turnId: string; replyHandle: string }>",
     description:
-      'Issue a Ticket authorizing one Turn on an Engagement, dispatch via agents.sendMessage, and return the four identifiers needed to follow the dispatch. Agent resolution: opts.preferredAgentId > engagement.preferredAgentId > engagement.boundAgentIds[0]. Ticket TTL default 5min; sweep on the scheduler tick releases expired tickets. Emits agents.scheduler.ticket-issued; agents.scheduler.ticket-released fires on turn-completed / turn-errored / TTL-expiry / explicit releaseTicket. v1 (Decision 34): fail-soft gate — sendMessage without ticketId proceeds with an agents.send-without-ticket warning. v2 makes the gate fail-closed.',
+      'Issue a Ticket authorizing one Turn on an Engagement, dispatch via agents.sendMessage, and return the four identifiers needed to follow the dispatch. Agent resolution: opts.preferredAgentId > engagement.preferredAgentId > engagement.boundAgentIds[0]. Ticket TTL default 5min; sweep on the scheduler tick releases expired tickets. Emits agents.scheduler.ticket-issued (with requestOverrides when caller supplied any); agents.scheduler.ticket-released fires on turn-completed / turn-errored / TTL-expiry / explicit releaseTicket. v1 (Decision 34): fail-soft gate — sendMessage without ticketId proceeds with an agents.send-without-ticket warning; v2 makes it fail-closed. Decision 36 step 1 (this version): pin, activityTable, complexity are accepted, recorded on the Ticket (ticket.requestOverrides) and audit payload, but routing still uses the v0 path — opts are captured for later AI-Choose / Activity-Table consultation.',
     sideEffect: 'external',
     example:
-      "const t = await runtime.scheduler.requestTurn({ engagementId: 'eng_abc', prompt: 'Summarize last 3 commits', outcome: 'summary', by: 'user' });",
+      "const t = await runtime.scheduler.requestTurn({ engagementId: 'eng_abc', prompt: 'Summarize last 3 commits', outcome: 'summary', by: 'user', pin: 'together/gpt-oss-120b' });",
     category: 'primary',
   },
   {

@@ -58,12 +58,12 @@ export const engagementFlowExposures: MethodExposure[] = [
     method: 'dispatchTurn',
     primitivePath: 'engagementFlow.dispatchTurn',
     signature:
-      '(engagementId: string, opts: { text: string; by?: string; agentId?: string; outcome?: string }): Promise<{ turnId: string; replyHandle: string; agentId: string; promptLen: number; prepSpliced: boolean }>',
+      "(engagementId: string, opts: { text: string; by?: string; agentId?: string; outcome?: string; pin?: string; activityTable?: Record<string, { mode: 'always'|'auto'|'ai'; default: string | null; outcomes?: Record<string, string> }>; complexity?: 'routine'|'specialized' }): Promise<{ turnId: string; replyHandle: string; agentId: string; ticketId?: string; promptLen: number; prepSpliced: boolean }>",
     description:
-      "One-call dispatch façade for a Turn on an Engagement. Resolves the agent (opts.agentId | engagement.preferredAgentId | engagement.boundAgentIds[0]), splices PrepData into the prompt on Turn #1, calls agents.sendMessage, links via engagements.addTurn, emits engagements.turn-queued. Returns { turnId, replyHandle, agentId, promptLen, prepSpliced }. v1: engagement-scoped lease (bound agent). v2 will route through scheduler.requestTurn for ticket-based scheduling — caller contract does NOT change.",
+      "One-call dispatch façade for a Turn on an Engagement. Resolves the agent (opts.agentId | engagement.preferredAgentId | engagement.boundAgentIds[0]), splices PrepData into the prompt on Turn #1, routes through scheduler.requestTurn (Decision 34 ticket model) when wired, links via engagements.addTurn, emits engagements.turn-queued. Returns { turnId, replyHandle, agentId, ticketId, promptLen, prepSpliced }. Decision 36 step 1: pin, activityTable, complexity are forwarded verbatim to scheduler.requestTurn — recorded on ticket.requestOverrides + audit; routing behavior unchanged in v0.",
     sideEffect: 'external',
     example:
-      "const t = await runtime.engagementFlow.dispatchTurn('eng_abc', { text: 'Summarize last 3 commits', by: 'user' });",
+      "const t = await runtime.engagementFlow.dispatchTurn('eng_abc', { text: 'Summarize last 3 commits', by: 'user', pin: 'together/gpt-oss-120b' });",
     category: 'primary',
   },
   {

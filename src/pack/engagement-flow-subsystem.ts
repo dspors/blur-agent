@@ -442,7 +442,24 @@ export class EngagementFlowSubsystem implements Persistable {
    */
   async dispatchTurn(
     engagementId: string,
-    opts: { text: string; by?: string; agentId?: string; outcome?: string } = { text: '' },
+    opts: {
+      text: string;
+      by?: string;
+      agentId?: string;
+      outcome?: string;
+      // ---------------------------------------------------------------
+      // Decision 36 step 1 — routing-override pass-through (recorded
+      // only; no behavior change in v0). Forwarded verbatim to
+      // scheduler.requestTurn which stamps them onto ticket.requestOverrides.
+      // ---------------------------------------------------------------
+      pin?: string;
+      activityTable?: Record<string, {
+        mode: 'always' | 'auto' | 'ai';
+        default: string | null;
+        outcomes?: Record<string, string>;
+      }>;
+      complexity?: 'routine' | 'specialized';
+    } = { text: '' },
   ): Promise<{
     turnId: string;
     replyHandle: string;
@@ -492,6 +509,12 @@ export class EngagementFlowSubsystem implements Persistable {
         preferredAgentId: opts.agentId,
         outcome: opts.outcome,
         by: opts.by ?? 'engagementFlow.dispatchTurn',
+        // Decision 36 step 1 — forward routing overrides untouched.
+        // requestTurn stamps them onto ticket.requestOverrides + emits
+        // them in the ticket-issued audit payload. v0 routing unchanged.
+        ...(opts.pin !== undefined ? { pin: opts.pin } : {}),
+        ...(opts.activityTable !== undefined ? { activityTable: opts.activityTable } : {}),
+        ...(opts.complexity !== undefined ? { complexity: opts.complexity } : {}),
       });
       turnId = issued.turnId;
       replyHandle = issued.replyHandle;
