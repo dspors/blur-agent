@@ -64,6 +64,28 @@ export interface Ticket {
    * Ticket records alone.
    */
   requestOverrides?: RequestOverrides;
+  /**
+   * Decision 36 step 2 — resolved (provider, model) for this Turn,
+   * stamped by the Scheduler's override-chain resolver. Distinct from
+   * `model` (the provider-native id) and from `requestOverrides.pin`
+   * (caller intent). UI's Turn-card chip + the RIGHT-pane routing
+   * block read these.
+   *
+   * Canonical ModelRef like 'local/gpt-oss-20b'.
+   */
+  selectedModelRef?: string;
+  /**
+   * Which override-chain layer produced selectedModelRef.
+   * Values: 'pin' | 'caller-table' | 'engagement' | 'activity-default'
+   *       | 'ai-choose' | 'baseline'.
+   */
+  selectionSource?: string;
+  /**
+   * One-line human-readable explanation of the selection — surfaces in
+   * the routing pane + audit replay so "why did this Turn use that
+   * model" is one read.
+   */
+  selectionRationale?: string;
 }
 
 /**

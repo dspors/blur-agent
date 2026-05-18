@@ -213,6 +213,23 @@ const pack: LibraryPack = {
     // Scheduler reaches into agents for candidate listing.
     scheduler.agentsRef = agents;
 
+    // Decision 36 step 2 — Scheduler reaches into runtime.tables (Model
+    // Table + Activity Table) to resolve the override chain in
+    // requestTurn. Optional: if the substrate hasn't mounted tables
+    // (e.g. older runtime), the resolver falls through to the layers
+    // that don't depend on system tables (pin, caller-table,
+    // engagement.runtimeModel, baseline).
+    const tables = (runtime as unknown as { tables?: {
+      listModels(): Array<{ modelRef: string; providerKind: string; providerModelId: string }>;
+      listActivityRouting(): Array<{ activityId: string; mode: string; default: string | null; outcomes?: Record<string, string> }>;
+    } }).tables;
+    if (tables && typeof tables.listModels === 'function' && typeof tables.listActivityRouting === 'function') {
+      scheduler.tablesRef = {
+        listModels: () => tables.listModels(),
+        listActivityRouting: () => tables.listActivityRouting(),
+      };
+    }
+
     // Engagement-flow auto-lease subscriber calls agents.lease(...);
     // dispatchTurn routes through scheduler.requestTurn (Decision 34).
     engagementFlow.agentsRef = agents;

@@ -566,6 +566,19 @@ export interface SendMessageOpts {
    * fail-soft; v2 will require tickets.
    */
   ticketId?: string;
+  /**
+   * Decision 36 step 2 — per-dispatch provider-native model override.
+   * Threaded through to provider.sendMessage so the D29 adapter passes
+   * it as req.model verbatim (instead of falling back to the bound
+   * agent's provider.model). The Scheduler populates this from the
+   * Ticket's resolved selection so per-call pins / engagement.runtimeModel
+   * / Activity Table defaults actually change what runs.
+   *
+   * Optional: providers that ignore it (mock, bridge today) just don't
+   * read it. Only providers that meaningfully accept a model id at
+   * dispatch time (D29 adapter → blur-providers-core) consume it.
+   */
+  model?: string;
 }
 
 /** Options for `agents.getReply()`. */

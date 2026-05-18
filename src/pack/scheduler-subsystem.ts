@@ -65,6 +65,13 @@ import {
   type TicketHistoryEvent,
   type TicketTerminalReason,
 } from './ticket-types';
+import {
+  resolveDispatch,
+  stampResolutionOnTicket,
+  type ActivityRoutingEntry,
+  type ModelRowLite,
+  type ResolvedDispatch,
+} from './scheduler-routing';
 
 interface Snapshot {
   schemaVersion: number;
@@ -107,6 +114,19 @@ export class SchedulerSubsystem implements Persistable {
    * tick can query candidate agents.
    */
   agentsRef: AgentsSubsystem | null = null;
+
+  /**
+   * Backref to runtime.tables (ConfigTablesSubsystem in blur-ai-runtime)
+   * — set by the pack install when the substrate exposes it. Read for
+   * the D36 step 2 override-chain resolver. Optional: when null the
+   * resolver falls through to baseline for system Activity Table
+   * lookups (per-call pin + caller table + engagement.runtimeModel
+   * still resolve independently).
+   */
+  tablesRef: {
+    listModels: () => Array<{ modelRef: string; providerKind: string; providerModelId: string }>;
+    listActivityRouting: () => Array<{ activityId: string; mode: string; default: string | null; outcomes?: Record<string, string> }>;
+  } | null = null;
 
   private tickTimer: NodeJS.Timeout | null = null;
   private algorithm: SchedulerAlgorithm = defaultAlgorithm();
@@ -487,7 +507,13 @@ export class SchedulerSubsystem implements Persistable {
     const engagementsApi = this.resolveEngagementsApi();
     const engagement = engagementsApi?.get
       ? (engagementsApi.get(opts.engagementId) as
-          | { id: string; boundAgentIds?: string[]; preferredAgentId?: string }
+          | {
+              id: string;
+              activityId?: string;
+              runtimeModel?: string;
+              boundAgentIds?: string[];
+              preferredAgentId?: string;
+            }
           | null)
       : null;
     if (!engagement) {
@@ -519,10 +545,8 @@ export class SchedulerSubsystem implements Persistable {
     }
 
     // Decision 36 step 1 — capture caller-supplied routing overrides
-    // onto the ticket and audit payload. Recorded only; v0 routing
-    // (above) still uses the boundAgentIds[0]/preferredAgentId path.
-    // Later D36 steps will consult these for AI-Choose / Activity-Table
-    // -driven dispatch.
+    // onto the ticket and audit payload (recorded independently of how
+    // the resolver chooses to honor them; useful for analytics).
     const requestOverrides: RequestOverrides | undefined =
       opts.pin !== undefined || opts.activityTable !== undefined || opts.complexity !== undefined
         ? {
@@ -532,25 +556,61 @@ export class SchedulerSubsystem implements Persistable {
           }
         : undefined;
 
-    // Issue the ticket.
+    // Decision 36 step 2 — resolve the override chain to a concrete
+    // (providerKind, modelRef, providerModelId, source). Pure function;
+    // see src/pack/scheduler-routing.ts.
+    const resolved = this.resolveDispatchForRequest(opts, engagement);
+
+    // Pin-fallback semantics (v1, fail-soft): if the resolved providerKind
+    // disagrees with the bound agent's kind, log/audit and use the agent's
+    // actual provider for THIS Turn. v2 step 3a will mint an ephemeral
+    // agent of the resolved kind via agents.lease + leasedFrom:'manual'.
+    const agentProviderKind = agent.provider?.kind ?? 'unknown';
+    let effectiveModel: string | undefined = resolved.providerModelId ?? undefined;
+    if (resolved.providerKind !== agentProviderKind) {
+      this.emit('agents.scheduler.pin-fallback', `item:agents`, {
+        engagementId: opts.engagementId,
+        agentId: candidateAgentId,
+        requested: {
+          modelRef: resolved.modelRef,
+          providerKind: resolved.providerKind,
+          providerModelId: resolved.providerModelId,
+          source: resolved.source,
+        },
+        substituted: {
+          providerKind: agentProviderKind,
+          model: (agent.provider as { model?: string } | undefined)?.model,
+        },
+        reason: 'cross-provider re-routing not yet supported in v1 (D36 step 3a)',
+      });
+      effectiveModel = (agent.provider as { model?: string } | undefined)?.model;
+    }
+
+    // Issue the ticket. Stamp the resolved selection so UI / audit
+    // replay can see what the resolver picked (even if pin-fallback
+    // substituted the agent's actual provider for this dispatch).
     const ticket = this.issueTicket({
       engagementId: opts.engagementId,
       agentId: candidateAgentId,
-      providerKind: agent.provider?.kind ?? 'unknown',
+      providerKind: agentProviderKind,
       outcome: opts.outcome,
       by: opts.by,
       ttlMs: opts.ttlMs ?? TICKET_TTL_MS,
       requestOverrides,
+      resolved,
     });
 
     // Dispatch through the AgentsSubsystem. sendMessage threads the
-    // ticketId through to the Turn record (Decision 34).
+    // ticketId through to the Turn record (Decision 34) AND the
+    // resolved model through to provider.sendMessage's req.model (D36
+    // step 2 — the per-dispatch override that makes routing real).
     let sent: { replyHandle: string; turnId?: string };
     try {
       sent = await this.agentsRef.sendMessage(candidateAgentId, {
         text: opts.prompt,
         by: opts.by ?? 'scheduler.requestTurn',
         ticketId: ticket.ticketId,
+        ...(effectiveModel !== undefined ? { model: effectiveModel } : {}),
       });
     } catch (err: unknown) {
       // Dispatch failed → release the ticket immediately.
@@ -650,8 +710,10 @@ export class SchedulerSubsystem implements Persistable {
     outcome?: string;
     by?: string;
     ttlMs: number;
-    /** Decision 36 step 1 — recorded only in v0. */
+    /** Decision 36 step 1 — caller intent (recorded, not necessarily honored). */
     requestOverrides?: RequestOverrides;
+    /** Decision 36 step 2 — resolved selection from the override-chain resolver. */
+    resolved?: ResolvedDispatch;
   }): Ticket {
     const ticketId = `tkt_${randomUUID()}`;
     const now = new Date();
@@ -667,6 +729,9 @@ export class SchedulerSubsystem implements Persistable {
       by: opts.by,
       ...(opts.requestOverrides ? { requestOverrides: opts.requestOverrides } : {}),
     };
+    if (opts.resolved) {
+      stampResolutionOnTicket(ticket, opts.resolved);
+    }
     this.activeByTicketId.set(ticketId, ticket);
     this.recordHistoryEvent(ticketId, 'issued');
     this._dirty = true;
@@ -678,11 +743,72 @@ export class SchedulerSubsystem implements Persistable {
       outcome: ticket.outcome,
       expiresAt: ticket.expiresAt,
       by: opts.by,
-      // Decision 36 step 1 — include the snapshot in audit so dispatch
-      // lineage is reproducible from the audit log alone.
+      // Decision 36 step 1 — caller intent snapshot.
       ...(opts.requestOverrides ? { requestOverrides: opts.requestOverrides } : {}),
+      // Decision 36 step 2 — resolved selection from the chain. Dispatch
+      // lineage is reproducible from the audit log alone (no need to read
+      // the live ticket store).
+      ...(opts.resolved
+        ? {
+            selectedModelRef: opts.resolved.modelRef,
+            selectionSource: opts.resolved.source,
+            selectionRationale: opts.resolved.rationale,
+          }
+        : {}),
     });
     return ticket;
+  }
+
+  /**
+   * Decision 36 step 2 — gather inputs for the pure resolver and apply
+   * it. Reads the system Activity Table + Model Table from the
+   * runtime.tables backref when available; otherwise the resolver
+   * falls through layers that don't depend on them (per-call pin,
+   * caller table, engagement.runtimeModel) and finally to baseline.
+   */
+  private resolveDispatchForRequest(
+    opts: RequestTurnOpts,
+    engagement: { activityId?: string; runtimeModel?: string },
+  ): ResolvedDispatch {
+    let systemTable: Map<string, ActivityRoutingEntry> | null = null;
+    let modelTable: Map<string, ModelRowLite> | null = null;
+    if (this.tablesRef) {
+      systemTable = new Map();
+      for (const row of this.tablesRef.listActivityRouting()) {
+        if (row.mode === 'always' || row.mode === 'auto' || row.mode === 'ai') {
+          systemTable.set(row.activityId, {
+            activityId: row.activityId,
+            mode: row.mode,
+            default: row.default,
+            outcomes: row.outcomes,
+          });
+        }
+      }
+      modelTable = new Map();
+      for (const row of this.tablesRef.listModels()) {
+        modelTable.set(row.modelRef, {
+          modelRef: row.modelRef,
+          providerKind: row.providerKind,
+          providerModelId: row.providerModelId,
+        });
+      }
+    }
+
+    return resolveDispatch({
+      opts: {
+        pin: opts.pin,
+        activityTable: opts.activityTable as Record<string, ActivityRoutingEntry> | undefined,
+        complexity: opts.complexity,
+        outcome: opts.outcome,
+      },
+      engagement: {
+        activityId: engagement.activityId ?? 'unknown',
+        runtimeModel: engagement.runtimeModel,
+      },
+      systemActivityTable: systemTable,
+      modelTable,
+      // baselineModelRef + aiChooseStub left at defaults for v1.
+    });
   }
 
   private markTicketActive(ticketId: string, turnId: string): void {

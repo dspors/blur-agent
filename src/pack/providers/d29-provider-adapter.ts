@@ -164,7 +164,13 @@ export function d29ProviderAdapter(
 
       // Build the ProviderRequest. v1 sends one user message; conversational
       // history threading is left to the caller / future ticket-context work.
-      const model = (provider as { model?: string }).model;
+      //
+      // Decision 36 step 2 — sendOpts.model wins over agent.provider.model
+      // when set. The Scheduler populates sendOpts.model from the resolved
+      // selection (providerModelId from the Model Table lookup), so per-call
+      // pins / engagement.runtimeModel / Activity Table defaults actually
+      // change what runs at dispatch time — not just what's recorded.
+      const model = sendOpts.model ?? (provider as { model?: string }).model;
       const req: InnerProviderRequest = {
         messages: [{ role: 'user', content: sendOpts.text }],
         ...(model !== undefined ? { model } : {}),
