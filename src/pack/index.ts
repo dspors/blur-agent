@@ -191,6 +191,21 @@ const SEEDED_ROLES = [
   },
 ];
 
+// Per-runtime subsystem registry — keyed by the runtime instance so
+// `uninstall()` can stop the subsystems it created in `install()`.
+// Without this, audit subscribers leak on `runtime.packs.reload()`:
+// the old subsystem's onEngagementOpened keeps firing alongside the
+// new one's, leading to duplicate auto-lease and ghost agent ids in
+// `engagement.boundAgentIds`. See `tkt_deb19c69-…`.
+interface InstalledSubsystems {
+  agents: AgentsSubsystem;
+  replies: AgentRepliesSubsystem;
+  turns: TurnsSubsystem;
+  scheduler: SchedulerSubsystem;
+  engagementFlow: EngagementFlowSubsystem;
+}
+const installedByRuntime: WeakMap<BlurAIRuntime, InstalledSubsystems> = new WeakMap();
+
 const pack: LibraryPack = {
   id: 'blur-agent',
   version: '0.4.0',
@@ -305,6 +320,12 @@ const pack: LibraryPack = {
     scheduler.start();
     engagementFlow.start();
 
+    // Register the subsystem set under this runtime so uninstall() can
+    // find them and stop their audit subscribers on pack reload.
+    installedByRuntime.set(runtime, {
+      agents, replies, turns, scheduler, engagementFlow,
+    });
+
     return {
       objects: { agents, replies, turns, scheduler, providers, engagementFlow },
       exposures: [
@@ -318,6 +339,25 @@ const pack: LibraryPack = {
         ...providers.collectExposures(),
       ],
     };
+  },
+
+  /**
+   * Called by the runtime on `runtime.packs.unload(...)` and as part of
+   * `runtime.packs.reload(...)`. Stops every subsystem we started so
+   * its audit subscribers are removed cleanly. Without this hook,
+   * pack reload leaks subscribers — see the comment on
+   * `installedByRuntime` above for the symptom (`tkt_deb19c69-…`).
+   */
+  uninstall(runtime: BlurAIRuntime): void {
+    const subsystems = installedByRuntime.get(runtime);
+    if (!subsystems) return;
+    try { subsystems.engagementFlow.stop(); } catch { /* swallow */ }
+    try { subsystems.scheduler.stop(); } catch { /* swallow */ }
+    try { subsystems.turns.stop(); } catch { /* swallow */ }
+    try { subsystems.replies.stop(); } catch { /* swallow */ }
+    // agents subsystem has no audit subscribers (no start/stop pair) —
+    // its state is durable via Persistable and is repopulated on reload.
+    installedByRuntime.delete(runtime);
   },
 };
 
