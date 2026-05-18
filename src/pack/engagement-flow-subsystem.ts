@@ -202,6 +202,22 @@ export class EngagementFlowSubsystem implements Persistable {
   private static SCRIPT_LOOP_CAP = 64;
 
   /**
+   * Activities whose user-initiated Turns get prior-Turn history appended
+   * to the prefix on dispatch. See `assemblePriorChainPrefix` for the
+   * append shape.
+   *
+   * Why opt-in per Activity: history-append is a tradeoff. For chat-style
+   * Activities (general), it preserves cross-Turn memory and keeps the
+   * KV cache warm across the user's whole conversation. For Activities
+   * that are explicitly stateless or per-Turn (e.g. a one-shot Activity
+   * that always reads fresh state and answers without conversational
+   * context), the history is wasted budget. v1 starts with general only;
+   * other Activities opt in via this set as we tune them. v2 will move
+   * this to `Activity.contextProjection.historyMode`.
+   */
+  private static HISTORY_APPEND_ACTIVITIES = new Set<string>(['general']);
+
+  /**
    * Per-Turn statistics, keyed by turnId. Populated by the script-loop
    * subscriber as each Turn completes. Survives until the engagement
    * exits liveEngagements OR the cap (TURN_STATS_CAP) is hit, after
@@ -718,12 +734,55 @@ export class EngagementFlowSubsystem implements Persistable {
     // providers get the warm-cache TTFT win.
     //
     // See `runtime.library.get('blur-inference-paradigm')` §11.
-    const prepData =
-      opts.skipPrepSplice ? null : this.prepDataByEng.get(engagementId) ?? null;
-    const finalText =
-      prepData !== null
-        ? formatPrepPreamble(engagementId, prepData) + '\n\n──\n\n' + opts.text
-        : opts.text;
+    // ---- Prompt assembly --------------------------------------------------
+    //
+    // Three paths:
+    //
+    // (1) Script-loop continuation (skipPrepSplice=true) — opts.text is
+    //     already a fully-assembled follow-up the subscriber built. Pass
+    //     through verbatim; no preamble, no history append.
+    //
+    // (2) User-initiated dispatch on an Activity that opted into history
+    //     append (HISTORY_APPEND_ACTIVITIES). Stitch the prior Turn chain
+    //     into the prefix so the model sees the full conversation. The
+    //     prior chain already contains the preamble at its top, so we
+    //     skip the preamble splice too.
+    //
+    // (3) User-initiated dispatch with no history (default Activities, or
+    //     the first prompt on a history-enabled Activity). Splice the
+    //     prep preamble at the top and append the user prompt. This is
+    //     the original v1 behavior.
+    //
+    // See state-advancement-loop §11 v1 scope table for how this composes
+    // with the cache discipline from blur-inference-paradigm §11.
+    let finalText: string;
+    let prepSplicedThisTurn: boolean;
+
+    if (opts.skipPrepSplice) {
+      // Path 1 — script-loop continuation. opts.text is the full follow-up.
+      finalText = opts.text;
+      prepSplicedThisTurn = false;
+    } else {
+      const history = await this.assemblePriorChainPrefix(engagementId);
+      if (history) {
+        // Path 2 — history-append for opted-in Activity. Prior chain ends
+        // with the assistant's final reply; we append a delimiter + the
+        // new user text. The prior chain already has the preamble at the
+        // top → byte-stable across the engagement's lifetime → KV cache
+        // hits the entire prior conversation on this dispatch.
+        finalText = history + '\n\n──\n\n' + opts.text;
+        prepSplicedThisTurn = false;
+      } else {
+        // Path 3 — fresh user prompt, no history (first prompt OR Activity
+        // didn't opt in). Original v1 path: preamble + delimiter + user text.
+        const prepData = this.prepDataByEng.get(engagementId) ?? null;
+        finalText =
+          prepData !== null
+            ? formatPrepPreamble(engagementId, prepData) + '\n\n──\n\n' + opts.text
+            : opts.text;
+        prepSplicedThisTurn = prepData !== null;
+      }
+    }
 
     // Remember the assembled prompt so the script-loop subscriber can
     // append iteration results to it without re-rendering the prefix.
@@ -803,7 +862,7 @@ export class EngagementFlowSubsystem implements Persistable {
       agentId,
       ticketId,
       promptLen: finalText.length,
-      prepSpliced: prepData !== null,
+      prepSpliced: prepSplicedThisTurn,
     };
   }
 
@@ -1060,6 +1119,45 @@ export class EngagementFlowSubsystem implements Persistable {
       meanDurationMs,
       recent,
     };
+  }
+
+  /**
+   * For Activities in HISTORY_APPEND_ACTIVITIES, stitch the prior Turn
+   * chain into a single byte-stable prefix to prepend to the next user
+   * prompt. Returns null when:
+   *   - the engagement has no Turns yet (first dispatch),
+   *   - the Activity isn't in the history-append opt-in set,
+   *   - the last Turn can't be fetched (engagement/agents subsystem
+   *     unavailable).
+   *
+   * The shape of the returned prefix is exactly what was last sent +
+   * the model's last reply:
+   *
+   *     <prior dispatched prompt (already has preamble at top)>
+   *     <prior assistant reply>
+   *
+   * Caller appends `\n\n──\n\n<new user text>` to produce the new
+   * dispatch. The new dispatch's KV cache hits the entire prior chain.
+   */
+  private async assemblePriorChainPrefix(engagementId: string): Promise<string | null> {
+    const eng = (await this.resolveEngagement(engagementId)) as
+      | { activityId?: string; turnIds?: string[] }
+      | null;
+    if (!eng) return null;
+    const activityId = eng.activityId ?? '';
+    if (!EngagementFlowSubsystem.HISTORY_APPEND_ACTIVITIES.has(activityId)) {
+      return null;
+    }
+    const turnIds = Array.isArray(eng.turnIds) ? eng.turnIds : [];
+    if (!turnIds.length) return null;
+    const lastTurnId = turnIds[turnIds.length - 1];
+    if (!lastTurnId) return null;
+    const lastTurn = await this.fetchTurn(lastTurnId);
+    if (!lastTurn) return null;
+    const priorRequestText = lastTurn.request?.text ?? '';
+    if (!priorRequestText) return null;
+    const priorReplyText = lastTurn.assembledText ?? '';
+    return priorRequestText + (priorReplyText ? '\n\n' + priorReplyText : '');
   }
 
   /**
