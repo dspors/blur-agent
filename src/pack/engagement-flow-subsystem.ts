@@ -52,6 +52,54 @@ interface RuntimeShape {
   packs?: { list?: () => unknown };
 }
 
+/**
+ * Local mirror of the walker's ResolverSpec shape so the generic tag
+ * dispatcher doesn't take a hard type dependency on blur-ai-runtime's
+ * internal type. Field shape per Decision 37 §3 +
+ * `src/subsystems/tag-walker.ts`.
+ */
+interface GenericResolverSpec {
+  kind: string;
+  tagName: string;
+  read?: { method: string };
+  list?: { method: string; filters?: string[] };
+  count?: { method: string; filters?: string[] };
+  write?: { method: string };
+  invoke?: Array<{
+    method: string;
+    primitivePath: string;
+    description?: string;
+    requiresId?: boolean;
+  }>;
+}
+
+/**
+ * Parse a comma-separated `filter="key:value,key:value"` attribute into
+ * an opts object. Keys outside the optional `allowedKeys` whitelist are
+ * dropped (the walker declares allowed filters per entity).
+ *
+ * Values are returned as strings; the underlying list primitive can
+ * coerce as needed. v1 doesn't try to type-resolve values from the
+ * attribute string.
+ */
+function parseFilterAttr(
+  s: string,
+  allowedKeys?: string[],
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!s) return out;
+  for (const pair of s.split(',')) {
+    const idx = pair.indexOf(':');
+    if (idx < 1) continue;
+    const k = pair.slice(0, idx).trim();
+    const v = pair.slice(idx + 1).trim();
+    if (!k) continue;
+    if (allowedKeys && !allowedKeys.includes(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
 interface EngagementsBridge {
   get?: (id: string) => unknown;
   addOutput?: (opts: { engagementId: string; output: { kind: string; ref: string; label?: string } }) => unknown;
@@ -384,6 +432,246 @@ export class EngagementFlowSubsystem implements Persistable {
     const path = (tag.body ?? '').trim();
     const value = path ? walkDotPath(entity, path) : entity;
     return { ok: true, value };
+  }
+
+  /**
+   * Resolve a Decision 37 descriptive entity tag (`<b:project>`,
+   * `<b:ticket>`, `<b:library>`, etc.) by consulting `runtime.tags.resolvers()`
+   * and dispatching by action attribute.
+   *
+   * Action defaults to `read`. Supported actions per declaration: read,
+   * list, count, update, invoke. Missing declarations for a given action
+   * return a structured error so the model sees what's available.
+   *
+   * Resolves entity references / methods host-side via
+   * `runtime.extensions.get(extName)`. Same `getter.call(ext, ...)` pattern
+   * as `resolveBPTag` to sidestep the script-isolate this-binding edge
+   * cases that bite `<b:script>` for primitives with backref state.
+   */
+  private async resolveGenericTag(tag: import('./b-tags').BTag): Promise<{
+    ok: boolean;
+    value?: unknown;
+    error?: string;
+  }> {
+    const tagName = tag.kind.startsWith('b:') ? tag.kind.slice(2) : tag.kind;
+    const walker = (this.runtime as RuntimeShape & {
+      tagWalker?: {
+        resolvers: (surface?: unknown) => Map<string, GenericResolverSpec>;
+      };
+    }).tagWalker;
+    if (!walker || typeof walker.resolvers !== 'function') {
+      return {
+        ok: false,
+        error: `<b:${tagName}>: runtime.tagWalker not available — substrate predates Decision 37 or walker subsystem failed to load.`,
+      };
+    }
+
+    let resolvers: Map<string, GenericResolverSpec>;
+    try {
+      resolvers = walker.resolvers();
+    } catch (err) {
+      return { ok: false, error: `walker.resolvers() failed: ${(err as Error).message}` };
+    }
+    const spec = resolvers.get(tagName);
+    if (!spec) {
+      const known = [...resolvers.keys()].sort().join(', ');
+      return {
+        ok: false,
+        error: `<b:${tagName}> unknown entity tag. Known tags: ${known}. (Use <b:script> for irregular operations.)`,
+      };
+    }
+
+    const action = (tag.attrs.action ?? 'read').toLowerCase();
+
+    switch (action) {
+      case 'read':
+        return this.runGenericRead(tagName, tag, spec);
+      case 'list':
+        return this.runGenericList(tagName, tag, spec);
+      case 'count':
+        return this.runGenericCount(tagName, tag, spec);
+      case 'update':
+        return this.runGenericUpdate(tagName, tag, spec);
+      case 'invoke':
+        return this.runGenericInvoke(tagName, tag, spec);
+      default:
+        return {
+          ok: false,
+          error: `<b:${tagName} action="${action}">: unsupported action. Supported: read, list, count, update, invoke.`,
+        };
+    }
+  }
+
+  /** Read one field via dot-path on an entity fetched by id. */
+  private async runGenericRead(
+    tagName: string,
+    tag: import('./b-tags').BTag,
+    spec: GenericResolverSpec,
+  ): Promise<{ ok: boolean; value?: unknown; error?: string }> {
+    if (!spec.read) {
+      return { ok: false, error: `<b:${tagName}>: 'read' action not supported for this entity.` };
+    }
+    const id = tag.attrs.id;
+    if (!id) {
+      return { ok: false, error: `<b:${tagName}>: read requires id="..."` };
+    }
+    const r = await this.invokePrimitive(spec.read.method, [id]);
+    if (!r.ok) return r;
+    if (r.value === null || r.value === undefined) {
+      return { ok: false, error: `<b:${tagName} id="${id}">: entity not found` };
+    }
+    const path = (tag.body ?? '').trim();
+    const value = path ? walkDotPath(r.value, path) : r.value;
+    return { ok: true, value };
+  }
+
+  /** List entities with optional filter attribute (comma-separated key:value). */
+  private async runGenericList(
+    tagName: string,
+    tag: import('./b-tags').BTag,
+    spec: GenericResolverSpec,
+  ): Promise<{ ok: boolean; value?: unknown; error?: string }> {
+    if (!spec.list) {
+      return { ok: false, error: `<b:${tagName}>: 'list' action not supported for this entity.` };
+    }
+    const filters = parseFilterAttr(tag.attrs.filter ?? '', spec.list.filters);
+    return this.invokePrimitive(spec.list.method, [filters]);
+  }
+
+  /** Count entities with optional filter attribute. */
+  private async runGenericCount(
+    tagName: string,
+    tag: import('./b-tags').BTag,
+    spec: GenericResolverSpec,
+  ): Promise<{ ok: boolean; value?: unknown; error?: string }> {
+    if (!spec.count) {
+      return { ok: false, error: `<b:${tagName}>: 'count' action not supported for this entity.` };
+    }
+    const filters = parseFilterAttr(tag.attrs.filter ?? '', spec.count.filters);
+    return this.invokePrimitive(spec.count.method, [filters]);
+  }
+
+  /** Update one field — body is the new value, path attribute is the field. */
+  private async runGenericUpdate(
+    tagName: string,
+    tag: import('./b-tags').BTag,
+    spec: GenericResolverSpec,
+  ): Promise<{ ok: boolean; value?: unknown; error?: string }> {
+    if (!spec.write) {
+      return { ok: false, error: `<b:${tagName}>: 'update' action not supported for this entity.` };
+    }
+    const id = tag.attrs.id;
+    if (!id) {
+      return { ok: false, error: `<b:${tagName} action="update">: requires id="..."` };
+    }
+    const path = tag.attrs.path;
+    if (!path) {
+      return { ok: false, error: `<b:${tagName} action="update">: requires path="<field>"` };
+    }
+    // Parse body — try JSON first, fall back to raw string.
+    const raw = tag.body.trim();
+    let parsedValue: unknown = raw;
+    try {
+      parsedValue = JSON.parse(raw);
+    } catch {
+      /* leave as string */
+    }
+    const patch: Record<string, unknown> = { [path]: parsedValue };
+    return this.invokePrimitive(spec.write.method, [id, patch]);
+  }
+
+  /** Invoke a method-style write declared in spec.invoke[]. */
+  private async runGenericInvoke(
+    tagName: string,
+    tag: import('./b-tags').BTag,
+    spec: GenericResolverSpec,
+  ): Promise<{ ok: boolean; value?: unknown; error?: string }> {
+    if (!spec.invoke?.length) {
+      return { ok: false, error: `<b:${tagName}>: 'invoke' action not supported for this entity.` };
+    }
+    const method = tag.attrs.method;
+    if (!method) {
+      return {
+        ok: false,
+        error: `<b:${tagName} action="invoke">: requires method="..." (available: ${spec.invoke.map(m => m.method).join(', ')})`,
+      };
+    }
+    const decl = spec.invoke.find(m => m.method === method);
+    if (!decl) {
+      return {
+        ok: false,
+        error: `<b:${tagName} action="invoke" method="${method}">: method not declared. Available: ${spec.invoke.map(m => m.method).join(', ')}`,
+      };
+    }
+    // Parse body — JSON expected for the payload.
+    const raw = tag.body.trim();
+    let payload: unknown = {};
+    if (raw.length) {
+      try {
+        payload = JSON.parse(raw);
+      } catch (err) {
+        return {
+          ok: false,
+          error: `<b:${tagName} action="invoke" method="${method}">: body must be valid JSON. Parse error: ${(err as Error).message}`,
+        };
+      }
+    }
+    const args: unknown[] = decl.requiresId
+      ? [tag.attrs.id, payload]
+      : [payload];
+    if (decl.requiresId && !tag.attrs.id) {
+      return {
+        ok: false,
+        error: `<b:${tagName} action="invoke" method="${method}">: this method requires id="..."`,
+      };
+    }
+    return this.invokePrimitive(decl.primitivePath, args);
+  }
+
+  /**
+   * Resolve a primitivePath (`<ext>.<method>` or deeper) to a callable on
+   * a registered extension object and invoke it with `getter.call(ext, ...)`.
+   * Sidesteps the script-isolate proxy `this`-binding issue.
+   *
+   * Returns the standard `{ok, value, error}` shape.
+   */
+  private async invokePrimitive(
+    primitivePath: string,
+    args: unknown[],
+  ): Promise<{ ok: boolean; value?: unknown; error?: string }> {
+    // primitivePath: 'tickets.get' → extName='tickets', methodPath=['get']
+    // primitivePath: 'workspaces.tools.add' → extName='workspaces', methodPath=['tools','add']
+    const segments = primitivePath.split('.');
+    if (segments.length < 2) {
+      return { ok: false, error: `invokePrimitive: invalid primitivePath '${primitivePath}'` };
+    }
+    const extName = segments[0]!;
+    const methodPath = segments.slice(1);
+    const ext = (this.runtime as RuntimeShape).extensions?.get?.(extName);
+    if (!ext || typeof ext !== 'object') {
+      return { ok: false, error: `invokePrimitive: extension '${extName}' not loaded` };
+    }
+    // Walk the methodPath; resolve the receiver for the final call so
+    // `this` binds to the right intermediate object.
+    let receiver: Record<string, unknown> = ext as Record<string, unknown>;
+    for (let i = 0; i < methodPath.length - 1; i++) {
+      const next = receiver[methodPath[i]!];
+      if (!next || typeof next !== 'object') {
+        return { ok: false, error: `invokePrimitive: '${primitivePath}' — '${methodPath.slice(0, i + 1).join('.')}' missing or not an object` };
+      }
+      receiver = next as Record<string, unknown>;
+    }
+    const methodName = methodPath[methodPath.length - 1]!;
+    const fn = receiver[methodName];
+    if (typeof fn !== 'function') {
+      return { ok: false, error: `invokePrimitive: '${primitivePath}' not callable` };
+    }
+    try {
+      const value = await Promise.resolve((fn as (...a: unknown[]) => unknown).call(receiver, ...args));
+      return { ok: true, value };
+    } catch (err) {
+      return { ok: false, error: (err as Error)?.message ?? String(err) };
+    }
   }
 
   /**
@@ -1246,19 +1534,30 @@ export class EngagementFlowSubsystem implements Persistable {
 
       // Execute each tag in source order; accumulate timing + size into stats.
       // Dispatch on tag.kind:
-      //   b:s — call runtime.script.run(body) (full expressivity, slow path)
-      //   b:p — call this.resolveBPTag(tag)   (host-side entity get + dot-path)
+      //   b:s / b:script — runtime.script.run(body) (full expressivity, escape hatch)
+      //   b:p            — resolveBPTag (legacy property-read shape)
+      //   b:<word>       — resolveGenericTag via walker resolver map (Decision 37)
       const resultBlocks: string[] = [];
       for (const tag of tags) {
         const t0 = Date.now();
         try {
           let r: { ok?: boolean; value?: unknown; error?: string };
-          if (tag.kind === 'b:p') {
+          if (tag.kind === 'b:script' || tag.kind === 'b:s') {
+            // Script escape hatch.
+            if (typeof scriptRunner === 'function') {
+              r = await scriptRunner(tag.body);
+            } else {
+              r = { ok: false, error: 'runtime.script.run unavailable on host' };
+            }
+          } else if (tag.kind === 'b:p') {
+            // Legacy property-read tag (Decision 37 says deprecated but
+            // keep functional during migration; the catalog won't teach
+            // it on new engagements).
             r = await this.resolveBPTag(tag);
-          } else if (typeof scriptRunner === 'function') {
-            r = await scriptRunner(tag.body);
           } else {
-            r = { ok: false, error: 'runtime.script.run unavailable on host' };
+            // Decision 37 — kind-first descriptive tag. Look up in walker
+            // resolver map and dispatch by action attribute.
+            r = await this.resolveGenericTag(tag);
           }
           const execMs = Date.now() - t0;
           stats.scriptExecMs += execMs;
