@@ -262,6 +262,26 @@ function renderLayer3(snapshotText?: string | null): string {
 // ============================================================================
 
 /**
+ * Per-layer breakdown returned by composePrefix. The full rendered
+ * prefix is `prefix` (already joined); `layers` carries each layer's
+ * text separately so consumers can inspect byte counts per layer or
+ * render diffs by layer.
+ *
+ * Used by previewPrefix (tuning workbench) to surface per-layer
+ * lengths; production dispatchers just read `.prefix`.
+ */
+export interface ComposedPrefix {
+  prefix: string;
+  layers: {
+    layer1A_blurIntro: string;
+    layer1B_activityDefinition: string;
+    layer1C_entityCatalog: string;
+    layer2_projectRole: string;
+    layer3_stateSnapshot: string;
+  };
+}
+
+/**
  * Build the full layered prefix (Layers 1A through 3) per Decision 37 §1.
  *
  * Layer 4 (chronological tail) is appended by the dispatch path
@@ -270,19 +290,30 @@ function renderLayer3(snapshotText?: string | null): string {
  * Layer 4 — the delimiter and the new user prompt are also appended
  * by `dispatchTurn`.
  *
- * Returns a single byte-stable string (deterministic given the same
- * inputs). The output is the prefix the model sees BEFORE the
- * chronological tail and current user prompt are appended.
+ * Returns the rendered prefix string PLUS a per-layer breakdown for
+ * inspection (Decision 37 § Tuning workbench — used by previewPrefix).
+ * Production callers can read `.prefix` directly.
+ *
+ * Byte-deterministic given the same inputs.
  */
-export function composePrefix(opts: ComposePrefixOpts): string {
+export function composePrefix(opts: ComposePrefixOpts): ComposedPrefix {
   const surface = opts.activity?.surface;
-  const parts: string[] = [];
-  parts.push(LAYER_1A_BLUR_INTRO);
-  parts.push(renderLayer1B(opts.activity));
-  parts.push(renderLayer1C(opts.runtime as RuntimeShape, surface));
-  parts.push(renderLayer2(opts.project, opts.agent));
-  parts.push(renderLayer3(opts.snapshotText));
-  return parts.join('\n');
+  const layer1A = LAYER_1A_BLUR_INTRO;
+  const layer1B = renderLayer1B(opts.activity);
+  const layer1C = renderLayer1C(opts.runtime as RuntimeShape, surface);
+  const layer2 = renderLayer2(opts.project, opts.agent);
+  const layer3 = renderLayer3(opts.snapshotText);
+  const prefix = [layer1A, layer1B, layer1C, layer2, layer3].join('\n');
+  return {
+    prefix,
+    layers: {
+      layer1A_blurIntro: layer1A,
+      layer1B_activityDefinition: layer1B,
+      layer1C_entityCatalog: layer1C,
+      layer2_projectRole: layer2,
+      layer3_stateSnapshot: layer3,
+    },
+  };
 }
 
 // ============================================================================

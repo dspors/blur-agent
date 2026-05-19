@@ -140,5 +140,17 @@ export const engagementFlowExposures: MethodExposure[] = [
     example: "const s = await runtime.engagementFlow.getEngagementStats('eng_abc', { limit: 10 });",
     category: 'support',
   },
+  {
+    objectPath: 'engagementFlow',
+    method: 'previewPrefix',
+    primitivePath: 'engagementFlow.previewPrefix',
+    signature:
+      '(engagementId: string, overrides?: { activity?: Partial<{purpose, responsibilities, objective, exitCriteria, aiInstructions, surface}>; snapshotTextOverride?: string }): Promise<{ engagementId: string; prefix: string; totalLen: number; layerLengths: {layer1A_blurIntro, layer1B_activityDefinition, layer1C_entityCatalog, layer2_projectRole, layer3_stateSnapshot}; warnings: string[] }>',
+    description:
+      'Render the six-layer model-facing prefix for an engagement WITHOUT dispatching a Turn (Decision 37 — tuning workbench). Optional overrides shallow-merge onto the engagement\'s current Activity record so you can preview "what would the prefix look like if I changed purpose/surface/contextProjection?" before committing the change to disk. Returns the full prefix + per-layer byte counts + warnings (missing project, missing PrepData, etc.). Does NOT render Layer 4 (chronological tail) — that\'s dispatch-time content.',
+    sideEffect: 'read',
+    example: "const p = await runtime.engagementFlow.previewPrefix('eng_abc', { activity: { surface: { include: ['ticket'] } } });\nconsole.log(p.totalLen, p.layerLengths);",
+    category: 'support',
+  },
   // engagementFlow.json is auto-exposed by the runtime for Persistable objects (decision 20).
 ];

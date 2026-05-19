@@ -754,6 +754,162 @@ export class EngagementFlowSubsystem implements Persistable {
   }
 
   /**
+   * Render the layered prefix for an engagement WITHOUT dispatching a
+   * Turn. Used by the tuning workbench to iterate on Activity definitions
+   * and projection settings without burning model tokens.
+   *
+   * Optional overrides let callers preview "what would the prefix look
+   * like if the Activity had purpose=X / surface=Y / contextProjection=Z?"
+   * before committing the change to disk. Overrides are shallow-merged
+   * onto the engagement's current Activity record.
+   *
+   * Returns the full rendered prefix plus a per-layer breakdown (byte
+   * length per layer) so consumers can see where cost / structure lives.
+   *
+   * Note: this doesn't render Layer 4 (chronological tail) — that's
+   * dispatch-time content. Use getEngagementStats(engId) or read recent
+   * Turn records to inspect the tail.
+   */
+  async previewPrefix(
+    engagementId: string,
+    overrides?: {
+      activity?: Partial<{
+        purpose: string;
+        responsibilities: string;
+        objective: string;
+        exitCriteria: string;
+        aiInstructions: string;
+        surface: { include?: '*' | string[]; exclude?: string[] };
+      }>;
+      snapshotTextOverride?: string;
+    },
+  ): Promise<{
+    engagementId: string;
+    prefix: string;
+    totalLen: number;
+    layerLengths: {
+      layer1A_blurIntro: number;
+      layer1B_activityDefinition: number;
+      layer1C_entityCatalog: number;
+      layer2_projectRole: number;
+      layer3_stateSnapshot: number;
+    };
+    warnings: string[];
+  }> {
+    const warnings: string[] = [];
+    const eng = (await this.resolveEngagement(engagementId)) as
+      | {
+          id: string;
+          activityId?: string;
+          scope?: { kind?: string; ref?: string };
+          preferredAgentId?: string;
+          boundAgentIds?: string[];
+        }
+      | null;
+    if (!eng) {
+      throw new Error(`engagementFlow.previewPrefix: unknown engagement '${engagementId}'`);
+    }
+
+    // Activity lookup + override application
+    const runtime = this.runtime as RuntimeShape & {
+      tagWalker?: { catalogText: (s?: unknown) => string };
+    };
+    let activity: NonNullable<Parameters<typeof composePrefix>[0]['activity']> | null = null;
+    try {
+      const activitiesExt = runtime.extensions?.get?.('activities') as
+        | { get?: (id: string) => unknown }
+        | undefined;
+      if (activitiesExt?.get && eng.activityId) {
+        const got = activitiesExt.get.call(activitiesExt, eng.activityId);
+        if (got && typeof got === 'object') {
+          activity = got as unknown as typeof activity;
+        }
+      }
+    } catch (err) {
+      warnings.push(`Activity lookup failed: ${(err as Error).message}`);
+    }
+    if (!activity) {
+      warnings.push(`Activity '${eng.activityId ?? '(none)'}' not found — Layer 1B will render an empty placeholder.`);
+    }
+    if (overrides?.activity) {
+      activity = { ...(activity ?? { id: eng.activityId ?? 'unknown' }), ...overrides.activity };
+    }
+
+    // Project lookup
+    let project: NonNullable<Parameters<typeof composePrefix>[0]['project']> | null = null;
+    if (eng.scope?.kind === 'project' && eng.scope.ref) {
+      try {
+        const projectsExt = runtime.extensions?.get?.('projects') as
+          | { get?: (id: string) => unknown }
+          | undefined;
+        if (projectsExt?.get) {
+          const got = projectsExt.get.call(projectsExt, eng.scope.ref);
+          if (got && typeof got === 'object') project = got as unknown as typeof project;
+        }
+      } catch (err) {
+        warnings.push(`Project lookup failed: ${(err as Error).message}`);
+      }
+      if (!project) {
+        warnings.push(`Project '${eng.scope.ref}' not found — Layer 2 will note 'no project bound'.`);
+      }
+    } else {
+      warnings.push('Engagement has no project scope — Layer 2 project block will be empty.');
+    }
+
+    // Agent lookup (best-effort)
+    let agent: NonNullable<Parameters<typeof composePrefix>[0]['agent']> | null = null;
+    const agentId = eng.preferredAgentId ?? eng.boundAgentIds?.[0];
+    if (agentId && this.agentsRef) {
+      try {
+        const got = this.agentsRef.get?.(agentId);
+        if (got && typeof got === 'object') agent = got as unknown as typeof agent;
+      } catch (err) {
+        warnings.push(`Agent lookup failed: ${(err as Error).message}`);
+      }
+    }
+    if (!agent) {
+      warnings.push('No agent bound — Layer 2 agent role will render as "unknown".');
+    }
+
+    // Snapshot — use override if provided, else PrepData, else null
+    let snapshotText: string | null = null;
+    if (overrides?.snapshotTextOverride !== undefined) {
+      snapshotText = overrides.snapshotTextOverride;
+    } else {
+      const prepData = this.prepDataByEng.get(engagementId) ?? null;
+      if (prepData) {
+        snapshotText = formatPrepSnapshot(engagementId, prepData);
+      } else {
+        warnings.push('No PrepData for this engagement — Layer 3 will show a deferred placeholder. Run runSecretaryPrep first.');
+      }
+    }
+
+    // Render via the composer's detailed shape
+    const composed = composePrefix({
+      runtime: this.runtime,
+      engagement: eng,
+      activity,
+      project,
+      agent,
+      snapshotText,
+    });
+
+    return {
+      engagementId,
+      prefix: composed.prefix,
+      totalLen: composed.prefix.length,
+      layerLengths: {
+        layer1A_blurIntro: composed.layers.layer1A_blurIntro.length,
+        layer1B_activityDefinition: composed.layers.layer1B_activityDefinition.length,
+        layer1C_entityCatalog: composed.layers.layer1C_entityCatalog.length,
+        layer2_projectRole: composed.layers.layer2_projectRole.length,
+        layer3_stateSnapshot: composed.layers.layer3_stateSnapshot.length,
+      },
+      warnings,
+    };
+  }
+
+  /**
    * Audit subscriber for entity-mutation events (Decision 37 §9 delta
    * tail). Classifies each event as Δ (value-diff) or + (new entity)
    * and appends to the per-engagement buffer for every currently-active
@@ -1084,7 +1240,7 @@ export class EngagementFlowSubsystem implements Persistable {
       agent,
       snapshotText,
       snapshotAt: prepData?.assembledAt,
-    });
+    }).prefix;
   }
 
   /**
