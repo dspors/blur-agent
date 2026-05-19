@@ -93,6 +93,34 @@ interface DeltaEntry {
 }
 
 /**
+ * Render a speaker-attribution label for Layer 4 chronological-tail
+ * entries. Multi-model engagements use this to label each Turn pair
+ * with the model that produced it so all participants (including the
+ * model itself on the next Turn) can see who said what.
+ *
+ * Shape:
+ *   single-model:   "Model — together/cogito-v2-1-671b"
+ *   role-tagged:    "Model A (run) — together/cogito-v2-1-671b"
+ *   fallback:       "Model"
+ *
+ * The label intentionally puts the model ref last so it's truncatable
+ * without losing the role context.
+ */
+function formatSpeakerLabel(
+  agent: { id?: string; role?: string; provider?: { kind?: string; model?: string } } | null,
+  providerKindHint?: string,
+): string {
+  const role = agent?.role;
+  const providerKind = agent?.provider?.kind ?? providerKindHint;
+  const model = agent?.provider?.model;
+  const modelRef = providerKind && model ? `${providerKind}/${model}` : providerKind ?? 'unknown';
+  if (role && role !== 'unknown' && role !== 'run') {
+    return `Model (${role}) — ${modelRef}`;
+  }
+  return `Model — ${modelRef}`;
+}
+
+/**
  * Parse a comma-separated `filter="key:value,key:value"` attribute into
  * an opts object. Keys outside the optional `allowedKeys` whitelist are
  * dropped (the walker declares allowed filters per entity).
@@ -197,6 +225,24 @@ export interface TurnStats {
    * `'error'` — handler threw before completing.
    */
   terminationReason: 'script-free' | 'has-tags' | 'cap-reached' | 'error';
+  /**
+   * Tag-emission profile (Decision 37 tuning workbench). Count of tags
+   * by kind in this iteration's reply. Examples:
+   *   { 'b:project': 2, 'b:script': 1 }  ← model used 2 entity reads + 1 script escape
+   *   { 'b:script': 3 }                   ← model only reached for the escape hatch
+   *   {}                                  ← tag-free reply (chain-terminating)
+   *
+   * The presence of `b:script` (or its alias `b:s`) when other kinds
+   * are zero is a strong signal the model isn't using the descriptive
+   * tag catalog effectively — tuning lever for prompt revisions.
+   */
+  tagsByKind: Record<string, number>;
+  /**
+   * True when the reply used `<b:script>` or `<b:s>` (the escape hatch).
+   * Derived from tagsByKind but exposed flat so consumers can filter
+   * quickly. Useful for the "model bypassed the catalog" signal.
+   */
+  usedScriptEscape: boolean;
 }
 
 /**
@@ -751,6 +797,164 @@ export class EngagementFlowSubsystem implements Persistable {
     } catch (err) {
       return { ok: false, error: (err as Error)?.message ?? String(err) };
     }
+  }
+
+  /**
+   * Multi-model collaboration dispatch (Decision 37 follow-on). Sugar
+   * over dispatchTurn that:
+   *
+   *   1. Wraps the prompt with a [<personLabel>:] header so the model
+   *      sees who is asking (essential when 2+ models share a transcript).
+   *   2. Pins the dispatch to a specific model via opts.pin (Decision 36
+   *      override-chain top layer).
+   *   3. Returns the dispatch result plus the speaker labels actually
+   *      rendered so the caller can echo them in any UI surface.
+   *
+   * The shared transcript lives in the engagement's Layer 4 chronological
+   * tail. assemblePriorChainPrefix already attributes each prior reply
+   * with [Model — <ref>]; this primitive adds the matching [Person:]
+   * (or named-label) headers to the user prompts.
+   *
+   * Use case: a person + two AI participants. Person uses dispatchAs to
+   * route each prompt to whichever model they want the next reply from.
+   * Both models see the full transcript with attribution and can
+   * coordinate (or disagree) coherently.
+   */
+  async dispatchAs(
+    engagementId: string,
+    opts: {
+      /** The raw user / person prompt text. */
+      text: string;
+      /** Model to pin for THIS dispatch. e.g. 'together/cogito-v2-1-671b'. */
+      asModel: string;
+      /**
+       * Label rendered alongside the user prompt in Layer 4. Defaults
+       * to 'Person'. Useful for naming when multiple people share a
+       * transcript ('Daniel', 'Sarah', etc.).
+       */
+      personLabel?: string;
+      /** Optional outcome — forwarded to dispatchTurn / scheduler. */
+      outcome?: string;
+      /** Attribution; defaults to 'dispatchAs:<personLabel>'. */
+      by?: string;
+    },
+  ): Promise<{
+    turnId: string;
+    replyHandle: string;
+    agentId: string;
+    ticketId?: string;
+    promptLen: number;
+    prepSpliced: boolean;
+    speakerLabel: string;
+    pinnedModel: string;
+  }> {
+    if (!opts || typeof opts.text !== 'string' || !opts.text.length) {
+      throw new Error('engagementFlow.dispatchAs: opts.text is required (non-empty string)');
+    }
+    if (!opts.asModel || typeof opts.asModel !== 'string') {
+      throw new Error('engagementFlow.dispatchAs: opts.asModel is required (e.g. "together/cogito-v2-1-671b")');
+    }
+    const personLabel = opts.personLabel?.trim() || 'Person';
+    const labeledText = `[${personLabel}:]\n${opts.text}`;
+    const dispatch = await this.dispatchTurn(engagementId, {
+      text: labeledText,
+      pin: opts.asModel,
+      by: opts.by ?? `dispatchAs:${personLabel}`,
+      ...(opts.outcome ? { outcome: opts.outcome } : {}),
+    });
+    return {
+      ...dispatch,
+      speakerLabel: personLabel,
+      pinnedModel: opts.asModel,
+    };
+  }
+
+  /**
+   * Parallel-comparison dispatch (Decision 37 follow-on). Sends the
+   * SAME prompt to N models in parallel, each in its own scratch Turn
+   * lineage, and returns a side-by-side report. NOT a shared transcript
+   * — each model sees only its own reply context.
+   *
+   * Different shape from dispatchAs (which appends to a shared
+   * transcript with attribution). Use dispatchToModels for:
+   *   - Tuning / model selection ("which model answers this best?")
+   *   - A/B routing decisions
+   *   - Generating diverse responses for synthesis
+   *
+   * v1 implementation: simple fan-out via N sequential dispatchTurn
+   * calls (each with a different pin). Each dispatch lands as its own
+   * Turn on the engagement; the caller correlates via the returned
+   * turnIds.
+   *
+   * Future: pseudo-parallel via Promise.all once we verify the
+   * scheduler can handle concurrent ticket issuance without races.
+   * v1 keeps it serial for predictability.
+   */
+  async dispatchToModels(
+    engagementId: string,
+    opts: {
+      text: string;
+      modelRefs: string[];
+      by?: string;
+      outcome?: string;
+    },
+  ): Promise<{
+    engagementId: string;
+    prompt: string;
+    results: Array<{
+      modelRef: string;
+      turnId: string;
+      replyHandle: string;
+      agentId: string;
+      ok: boolean;
+      error?: string;
+    }>;
+  }> {
+    if (!opts.text || typeof opts.text !== 'string') {
+      throw new Error('engagementFlow.dispatchToModels: opts.text is required (non-empty string)');
+    }
+    if (!Array.isArray(opts.modelRefs) || opts.modelRefs.length === 0) {
+      throw new Error('engagementFlow.dispatchToModels: opts.modelRefs must be a non-empty array');
+    }
+    const results: Array<{
+      modelRef: string;
+      turnId: string;
+      replyHandle: string;
+      agentId: string;
+      ok: boolean;
+      error?: string;
+    }> = [];
+    for (const modelRef of opts.modelRefs) {
+      try {
+        const dispatch = await this.dispatchTurn(engagementId, {
+          text: opts.text,
+          pin: modelRef,
+          by: opts.by ?? `dispatchToModels:${modelRef}`,
+          ...(opts.outcome ? { outcome: opts.outcome } : {}),
+        });
+        results.push({
+          modelRef,
+          turnId: dispatch.turnId,
+          replyHandle: dispatch.replyHandle,
+          agentId: dispatch.agentId,
+          ok: true,
+        });
+      } catch (err) {
+        results.push({
+          modelRef,
+          turnId: '',
+          replyHandle: '',
+          agentId: '',
+          ok: false,
+          error: (err as Error)?.message ?? String(err),
+        });
+      }
+    }
+    return {
+      engagementId,
+      prompt: opts.text,
+      results,
+    };
   }
 
   /**
@@ -1934,6 +2138,13 @@ export class EngagementFlowSubsystem implements Persistable {
       const endedAt = typeof turn.endedAt === 'string' ? turn.endedAt : '';
       const durationMs =
         startedAt && endedAt ? Math.max(0, Date.parse(endedAt) - Date.parse(startedAt)) : 0;
+      // Decision 37 — tag-emission profile for tuning workbench.
+      const tagsByKind: Record<string, number> = {};
+      for (const t of tags) {
+        tagsByKind[t.kind] = (tagsByKind[t.kind] ?? 0) + 1;
+      }
+      const usedScriptEscape = !!(tagsByKind['b:script'] || tagsByKind['b:s']);
+
       const stats: TurnStats = {
         turnId,
         engagementId,
@@ -1950,6 +2161,8 @@ export class EngagementFlowSubsystem implements Persistable {
         providerKind: turn.providerKind,
         agentId: turn.agentId,
         terminationReason: 'script-free', // updated below
+        tagsByKind,
+        usedScriptEscape,
       };
 
       // No tags → chain terminates naturally. Record stats + bail.
@@ -2203,18 +2416,53 @@ export class EngagementFlowSubsystem implements Persistable {
     if (!priorRequestText) return null;
     const priorReplyText = lastTurn.assembledText ?? '';
 
-    // Decision 37 §9 — drain any accumulated entity-mutation deltas and
-    // append them after the prior Turn pair. Deltas become part of the
-    // byte-stable prior chain on the next dispatch so they aren't
-    // repeated; KV cache stays warm for the whole accumulated tail.
+    // Decision 37 §9 + multi-model collab — render the prior Turn pair
+    // with speaker attribution so multi-model engagements know who said
+    // what. Single-model engagements get the same labels (cheap, makes
+    // intent explicit).
+    //
+    // The prior dispatched prompt may itself be a prior chain that
+    // already contains [Person:] / [Model:] labels — we don't try to
+    // re-label that bytespan (would invalidate cache and double-label).
+    // Only the NEW user prompt + assistant reply at the tail get the
+    // attribution headers.
+    const priorAgent = lastTurn.agentId
+      ? await this.lookupAgentForAttribution(lastTurn.agentId as string)
+      : null;
+    const speakerLabel = formatSpeakerLabel(priorAgent, lastTurn.providerKind as string | undefined);
+
+    // Decision 37 §9 — drain any accumulated entity-mutation deltas.
     const deltaBlock = this.drainDeltas(engagementId);
 
     const parts: string[] = [priorRequestText];
-    if (priorReplyText) parts.push(priorReplyText);
+    if (priorReplyText) {
+      parts.push(`[${speakerLabel}]\n${priorReplyText}`);
+    }
     if (deltaBlock) {
       parts.push('[DELTA — runtime changes since prior Turn]\n' + deltaBlock);
     }
     return parts.join('\n\n');
+  }
+
+  /**
+   * Best-effort agent lookup for speaker attribution in Layer 4. Returns
+   * a small subset of fields the chronological-tail render needs.
+   */
+  private async lookupAgentForAttribution(
+    agentId: string,
+  ): Promise<{ id: string; role?: string; provider?: { kind?: string; model?: string } } | null> {
+    if (!this.agentsRef) return null;
+    try {
+      const got = this.agentsRef.get?.(agentId);
+      if (!got || typeof got !== 'object') return null;
+      return got as unknown as {
+        id: string;
+        role?: string;
+        provider?: { kind?: string; model?: string };
+      };
+    } catch {
+      return null;
+    }
   }
 
   /**

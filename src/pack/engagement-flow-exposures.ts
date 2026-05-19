@@ -142,6 +142,30 @@ export const engagementFlowExposures: MethodExposure[] = [
   },
   {
     objectPath: 'engagementFlow',
+    method: 'dispatchAs',
+    primitivePath: 'engagementFlow.dispatchAs',
+    signature:
+      "(engagementId: string, opts: { text: string; asModel: string; personLabel?: string; outcome?: string; by?: string }): Promise<{ turnId, replyHandle, agentId, ticketId?, promptLen, prepSpliced, speakerLabel, pinnedModel }>",
+    description:
+      "Multi-model collaboration dispatch (D37 follow-on). Wraps the prompt with a [<personLabel>:] header so the model sees who is asking, pins this dispatch to opts.asModel, and routes through dispatchTurn. The shared transcript lives in the engagement's Layer 4 chronological tail with speaker attribution per Turn pair. Use when 2+ models share an engagement and a person drives which model answers each prompt.",
+    sideEffect: 'external',
+    example: "await runtime.engagementFlow.dispatchAs('eng_abc', { text: 'What do you think about the cogito reply?', asModel: 'together/gpt-oss-120b', personLabel: 'Daniel' });",
+    category: 'primary',
+  },
+  {
+    objectPath: 'engagementFlow',
+    method: 'dispatchToModels',
+    primitivePath: 'engagementFlow.dispatchToModels',
+    signature:
+      '(engagementId: string, opts: { text: string; modelRefs: string[]; by?: string; outcome?: string }): Promise<{ engagementId, prompt, results: Array<{ modelRef, turnId, replyHandle, agentId, ok, error? }> }>',
+    description:
+      'Parallel-comparison dispatch (D37 follow-on). Sends the SAME prompt to N models in sequence on the same engagement and returns a side-by-side report. Each dispatch lands as its own Turn — caller correlates via the returned turnIds. Use for tuning ("which model answers best?"), A/B routing decisions, or diverse-response synthesis. v1 is serial for predictability; future may parallelize.',
+    sideEffect: 'external',
+    example: "const r = await runtime.engagementFlow.dispatchToModels('eng_abc', { text: 'hello', modelRefs: ['together/gpt-oss-120b', 'together/cogito-v2-1-671b'] });",
+    category: 'primary',
+  },
+  {
+    objectPath: 'engagementFlow',
     method: 'previewPrefix',
     primitivePath: 'engagementFlow.previewPrefix',
     signature:
