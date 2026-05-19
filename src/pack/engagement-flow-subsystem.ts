@@ -24,6 +24,7 @@ import { parseBTags, renderTagResult, stringifyScriptReturn } from './b-tags';
 import type { AgentsSubsystem } from './agents-subsystem';
 import type { SchedulerSubsystem } from './scheduler-subsystem';
 import { resolveDispatch } from './scheduler-routing';
+import { composePrefix } from './prefix-composer';
 import {
   DEFAULT_PREP_STEPS,
   LINKER_OUTPUT_KINDS,
@@ -383,6 +384,116 @@ export class EngagementFlowSubsystem implements Persistable {
     const path = (tag.body ?? '').trim();
     const value = path ? walkDotPath(entity, path) : entity;
     return { ok: true, value };
+  }
+
+  /**
+   * Compose the six-layer prefix from Decision 37 when the substrate's
+   * `runtime.tagWalker` subsystem is present. Returns the rendered
+   * prefix (without the user prompt or delimiter — caller appends those)
+   * or `null` when the walker isn't available (substrate predates D37).
+   *
+   * Layers built here:
+   *   1A — Blur intro (constant in prefix-composer)
+   *   1B — Activity definition (from runtime.activities.get(activityId))
+   *   1C — Entity catalog (from runtime.tagWalker.catalogText(surface))
+   *   2  — Project + role (from runtime.projects.get + agent record)
+   *   3  — State snapshot (formatPrepSnapshot of PrepData) + NOTE block
+   *
+   * Best-effort lookups: missing project / agent / activity each render
+   * a [-] stub line; the prefix still composes. Cache stability rides
+   * on the byte-identical output for the same inputs — every lookup is
+   * deterministic given the durable runtime store.
+   */
+  private composeLayeredPrefixIfAvailable(
+    engagementId: string,
+    engagement: {
+      id: string;
+      activityId?: string;
+      scope?: { kind?: string; ref?: string };
+      preferredAgentId?: string;
+      boundAgentIds?: string[];
+    },
+    prepData: PrepData | null,
+  ): string | null {
+    const runtime = this.runtime as RuntimeShape & {
+      tagWalker?: {
+        catalogText: (surface?: { include?: '*' | string[]; exclude?: string[] }) => string;
+        entityList: (surface?: unknown) => unknown[];
+      };
+    };
+    if (!runtime.tagWalker || typeof runtime.tagWalker.catalogText !== 'function') {
+      return null;
+    }
+
+    // Look up Activity by id. Activities pack exposes runtime.activities.get.
+    let activity: {
+      id: string;
+      label?: string;
+      purpose?: string;
+      responsibilities?: string;
+      objective?: string;
+      exitCriteria?: string;
+      aiInstructions?: string;
+      surface?: { include?: '*' | string[]; exclude?: string[] };
+    } | null = null;
+    try {
+      const activitiesExt = runtime.extensions?.get?.('activities') as
+        | { get?: (id: string) => unknown }
+        | undefined;
+      if (activitiesExt?.get && engagement.activityId) {
+        const got = activitiesExt.get.call(activitiesExt, engagement.activityId);
+        if (got && typeof got === 'object') activity = got as unknown as typeof activity;
+      }
+    } catch {
+      /* swallow — best-effort */
+    }
+
+    // Look up Project when engagement.scope.kind === 'project'.
+    let project: {
+      id: string;
+      label?: string;
+      direction?: { northStar?: string; target?: string };
+    } | null = null;
+    if (engagement.scope?.kind === 'project' && engagement.scope.ref) {
+      try {
+        const projectsExt = runtime.extensions?.get?.('projects') as
+          | { get?: (id: string) => unknown }
+          | undefined;
+        if (projectsExt?.get) {
+          const got = projectsExt.get.call(projectsExt, engagement.scope.ref);
+          if (got && typeof got === 'object') project = got as unknown as typeof project;
+        }
+      } catch {
+        /* swallow */
+      }
+    }
+
+    // Look up Agent — preferred bound agent, fall back to first bound.
+    let agent: { id: string; role?: string; roleDoc?: string } | null = null;
+    const agentId = engagement.preferredAgentId ?? engagement.boundAgentIds?.[0];
+    if (agentId && this.agentsRef) {
+      try {
+        const got = this.agentsRef.get?.(agentId);
+        if (got && typeof got === 'object') agent = got as unknown as typeof agent;
+      } catch {
+        /* swallow */
+      }
+    }
+
+    // Render the snapshot from PrepData (when available).
+    const snapshotText = prepData
+      ? formatPrepSnapshot(engagementId, prepData)
+      : null;
+
+    return composePrefix({
+      runtime: this.runtime,
+      engagement,
+      activity,
+      project,
+      agent,
+      snapshotText,
+      snapshotAt: prepData?.assembledAt,
+    });
   }
 
   /**
@@ -907,13 +1018,28 @@ export class EngagementFlowSubsystem implements Persistable {
         prepSplicedThisTurn = false;
       } else {
         // Path 3 — fresh user prompt, no history (first prompt OR Activity
-        // didn't opt in). Original v1 path: preamble + delimiter + user text.
+        // didn't opt in).
+        //
+        // Decision 37: when the substrate exposes runtime.tagWalker, build
+        // the six-layer prefix (Blur intro → Activity definition → entity
+        // catalog → project/role → snapshot + NOTE). Falls back to the
+        // legacy formatPrepPreamble otherwise (substrate predates D37).
         const prepData = this.prepDataByEng.get(engagementId) ?? null;
-        finalText =
-          prepData !== null
-            ? formatPrepPreamble(engagementId, prepData) + '\n\n──\n\n' + opts.text
-            : opts.text;
-        prepSplicedThisTurn = prepData !== null;
+        const layered = this.composeLayeredPrefixIfAvailable(
+          engagementId,
+          engagement as { id: string; activityId?: string; scope?: { kind?: string; ref?: string }; preferredAgentId?: string; boundAgentIds?: string[] },
+          prepData,
+        );
+        if (layered !== null) {
+          finalText = layered + '\n\n──\n\n' + opts.text;
+          prepSplicedThisTurn = true;
+        } else {
+          finalText =
+            prepData !== null
+              ? formatPrepPreamble(engagementId, prepData) + '\n\n──\n\n' + opts.text
+              : opts.text;
+          prepSplicedThisTurn = prepData !== null;
+        }
       }
     }
 
@@ -1812,6 +1938,49 @@ function clonePrepData(p: PrepData): PrepData {
  * `assembledAt` is retained on the PrepData record (audit / debug
  * surface) — it just doesn't appear in the rendered block.
  */
+/**
+ * Render ONLY the engagement-state snapshot body (no protocol teaching).
+ * Used by the new layered prefix composer (Decision 37) as Layer 3.
+ * The protocol teaching is handled by Layer 1A (Blur intro) + Layer 1C
+ * (walker-generated catalog) instead.
+ *
+ * Byte-stable across Turns — same pure-function-of-PrepData property as
+ * formatPrepPreamble (no timestamps, no wall-clock state).
+ */
+function formatPrepSnapshot(engagementId: string, prep: PrepData): string {
+  const lines: string[] = [];
+  lines.push(`engagement: ${engagementId}`);
+  lines.push('');
+  lines.push('## Project');
+  lines.push(`  id:       ${prep.project.id}`);
+  lines.push(`  label:    ${prep.project.label}`);
+  if (prep.project.northStar) {
+    const ns = typeof prep.project.northStar === 'string'
+      ? prep.project.northStar
+      : JSON.stringify(prep.project.northStar);
+    lines.push(`  northStar: ${truncate(ns, 240)}`);
+  }
+  if (prep.project.target) lines.push(`  target:   ${prep.project.target}`);
+  if (prep.project.tracks.length) {
+    lines.push('');
+    lines.push('## Tracks');
+    for (const t of prep.project.tracks) {
+      lines.push(`  - ${t.id} (${t.status}, ${t.stepCount} step${t.stepCount === 1 ? '' : 's'}): ${t.label}`);
+    }
+  }
+  lines.push('');
+  lines.push('## Agent');
+  lines.push(`  role:    ${prep.agent.role}`);
+  if (prep.agent.roleDoc) lines.push(`  roleDoc: ${prep.agent.roleDoc}`);
+  lines.push('');
+  lines.push('## Runtime');
+  lines.push(`  version: ${prep.runtime.version}`);
+  if (prep.runtime.packsLoaded.length) {
+    lines.push(`  packs:   ${prep.runtime.packsLoaded.slice(0, 12).join(', ')}${prep.runtime.packsLoaded.length > 12 ? ', …' : ''}`);
+  }
+  return lines.join('\n');
+}
+
 function formatPrepPreamble(engagementId: string, prep: PrepData): string {
   const lines: string[] = [];
   // Protocol teaching block — byte-stable across all Turns/iterations.

@@ -338,6 +338,38 @@ const pack: LibraryPack = {
         // them up when third-party providers do.
         ...providers.collectExposures(),
       ],
+      // Decision 37: entity declarations consumed by runtime.tags walker.
+      // Agent + Turn entities live here (Engagement is owned by blur-project,
+      // not blur-agent, despite the related subsystem reference here).
+      entities: [
+        {
+          kind: 'agent',
+          label: 'Agent',
+          description:
+            'A durable AI-session identity holding role, provider, and scope ' +
+            'bindings. Survives session rotation. Bound to an Engagement during ' +
+            'dispatch.',
+          idShape: 'agt_<hex>',
+          read: { method: 'agents.get' },
+          list: {
+            method: 'agents.list',
+            filters: ['role', 'status'],
+          },
+        },
+        {
+          kind: 'turn',
+          label: 'Turn',
+          description:
+            'One model←→substrate exchange within an Engagement. Carries prompt, ' +
+            'assembled text (model reply), provider/model, status, iteration data.',
+          idShape: 'tur_<hex>',
+          read: { method: 'turns.get' },
+          list: {
+            method: 'turns.list',
+            filters: ['agentId', 'status', 'since'],
+          },
+        },
+      ],
     };
   },
 
