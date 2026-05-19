@@ -30,6 +30,26 @@ The role catalog is an **open registry**. blur-agent seeds eight
 default roles at install; packs and runtime callers can register
 additional roles via `runtime.agents.roles.register(...)`.
 
+## v0.1 implementation status
+
+Two roles get their first runtime subsystems in v0.1 of the
+substrate (per `brief-mvp-substrate-v1`):
+
+| Role | v0.1 status | Subsystem | Doc |
+|---|---|---|---|
+| **Run** | **Implemented (Runner construct)** — `runtime.runners.*` | `run-subsystem.ts` | `role-run.md` |
+| **Secretary** | **Implemented (transcript sync)** — `runtime.secretary.*` | `secretary-subsystem.ts` | `role-secretary.md` |
+| Conductor | Doc only — bootstrap via human/UI | — | (forthcoming) |
+| Project Coordinator | Doc only — see role-project-coordinator | — | `role-project-coordinator.md` |
+| Supervisor | Existing patterns (supervisor-patterns.md) | — | `supervisor-patterns.md` |
+| Configuration | Doc only | — | (forthcoming) |
+| Oversight | Doc only | — | (forthcoming) |
+| Scheduler | Doc only | — | (forthcoming) |
+
+The other six remain documentation-only until their patterns
+crystallize. The bootstrap path: human/UI plays the role manually;
+as automation lands, the role's subsystem takes over.
+
 ## The eight seeded roles
 
 | Role id | Label | Responsibility | Default binding scopes |

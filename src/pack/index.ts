@@ -30,12 +30,16 @@ import { TurnsSubsystem } from './turns-subsystem';
 import { SchedulerSubsystem } from './scheduler-subsystem';
 import { ProviderRegistry } from './provider-registry';
 import { EngagementFlowSubsystem } from './engagement-flow-subsystem';
+import { RunSubsystem } from './run-subsystem';
+import { SecretarySubsystem } from './secretary-subsystem';
 import { bridgeProviderImpl } from './providers/bridge-provider';
 import { mockProviderImpl } from './providers/mock-provider';
 import { installD29Adapters } from './providers/d29-provider-adapter';
 import { exposures } from './exposures';
 import { schedulerExposures } from './scheduler-exposures';
 import { engagementFlowExposures } from './engagement-flow-exposures';
+import { runExposures } from './run-exposures';
+import { secretaryExposures } from './secretary-exposures';
 
 export { AgentsSubsystem } from './agents-subsystem';
 export { AgentRepliesSubsystem } from './replies-subsystem';
@@ -217,6 +221,11 @@ const pack: LibraryPack = {
     const scheduler = new SchedulerSubsystem(runtime);
     const providers = new ProviderRegistry();
     const engagementFlow = new EngagementFlowSubsystem(runtime);
+    const runners = new RunSubsystem();
+    const secretary = new SecretarySubsystem();
+    runners.attachRuntime(runtime);
+    secretary.attachRuntime(runtime);
+    secretary.attachRuns(runners);
 
     // Wire the backrefs on the agents subsystem so the dispatch
     // methods (sendMessage / sendText / getReply / sendMessageAndAwait)
@@ -327,11 +336,13 @@ const pack: LibraryPack = {
     });
 
     return {
-      objects: { agents, replies, turns, scheduler, providers, engagementFlow },
+      objects: { agents, replies, turns, scheduler, providers, engagementFlow, runners, secretary },
       exposures: [
         ...exposures,
         ...schedulerExposures,
         ...engagementFlowExposures,
+        ...runExposures,
+        ...secretaryExposures,
         // Per-provider exposures (Decision 29 escape-hatch pattern).
         // Mounted under runtime.agents.providers.<kind>.*. Today none
         // of the built-in providers ship custom exposures; this picks
