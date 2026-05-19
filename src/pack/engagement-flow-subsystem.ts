@@ -1609,28 +1609,28 @@ export class EngagementFlowSubsystem implements Persistable {
         prepSplicedThisTurn = false;
       } else {
         // Path 3 — fresh user prompt, no history (first prompt OR Activity
-        // didn't opt in).
+        // didn't opt in). Decision 37 layered prefix: Blur intro → Activity
+        // definition → entity catalog → project/role → snapshot + NOTE.
         //
-        // Decision 37: when the substrate exposes runtime.tagWalker, build
-        // the six-layer prefix (Blur intro → Activity definition → entity
-        // catalog → project/role → snapshot + NOTE). Falls back to the
-        // legacy formatPrepPreamble otherwise (substrate predates D37).
+        // The walker subsystem (runtime.tagWalker) is part of the substrate
+        // and is guaranteed present post-D37 — composeLayeredPrefixIfAvailable
+        // returning null is treated as a substrate misconfiguration (loud
+        // error, not silent fallback to a different prefix shape).
         const prepData = this.prepDataByEng.get(engagementId) ?? null;
         const layered = this.composeLayeredPrefixIfAvailable(
           engagementId,
           engagement as { id: string; activityId?: string; scope?: { kind?: string; ref?: string }; preferredAgentId?: string; boundAgentIds?: string[] },
           prepData,
         );
-        if (layered !== null) {
-          finalText = layered + '\n\n──\n\n' + opts.text;
-          prepSplicedThisTurn = true;
-        } else {
-          finalText =
-            prepData !== null
-              ? formatPrepPreamble(engagementId, prepData) + '\n\n──\n\n' + opts.text
-              : opts.text;
-          prepSplicedThisTurn = prepData !== null;
+        if (layered === null) {
+          throw new Error(
+            'engagementFlow.dispatchTurn: layered prefix composer returned null — ' +
+              'runtime.tagWalker missing or walker.catalogText failed. Decision 37 substrate ' +
+              'must be loaded. (Check runtime.tagWalker is mounted; check pack load order.)',
+          );
         }
+        finalText = layered + '\n\n──\n\n' + opts.text;
+        prepSplicedThisTurn = true;
       }
     }
 
@@ -2595,47 +2595,6 @@ function formatPrepSnapshot(engagementId: string, prep: PrepData): string {
   return lines.join('\n');
 }
 
-function formatPrepPreamble(engagementId: string, prep: PrepData): string {
-  const lines: string[] = [];
-  // Protocol teaching block — byte-stable across all Turns/iterations.
-  // Per state-advancement-loop §3, this section tells the model how to
-  // emit `<b:s>` tags. v1 covers scripts only; file ops are reserved.
-  lines.push(PROTOCOL_TEACHING_BLOCK);
-  lines.push('');
-  lines.push(`[Engagement context]`);
-  lines.push('');
-  lines.push(`engagement: ${engagementId}`);
-  lines.push('');
-  lines.push('## Project');
-  lines.push(`  id:       ${prep.project.id}`);
-  lines.push(`  label:    ${prep.project.label}`);
-  if (prep.project.northStar) {
-    const ns = typeof prep.project.northStar === 'string'
-      ? prep.project.northStar
-      : JSON.stringify(prep.project.northStar);
-    lines.push(`  northStar: ${truncate(ns, 240)}`);
-  }
-  if (prep.project.target) lines.push(`  target:   ${prep.project.target}`);
-  if (prep.project.tracks.length) {
-    lines.push('');
-    lines.push('## Tracks');
-    for (const t of prep.project.tracks) {
-      lines.push(`  - ${t.id} (${t.status}, ${t.stepCount} step${t.stepCount === 1 ? '' : 's'}): ${t.label}`);
-    }
-  }
-  lines.push('');
-  lines.push('## Agent');
-  lines.push(`  role:    ${prep.agent.role}`);
-  if (prep.agent.roleDoc) lines.push(`  roleDoc: ${prep.agent.roleDoc}`);
-  lines.push('');
-  lines.push('## Runtime');
-  lines.push(`  version: ${prep.runtime.version}`);
-  if (prep.runtime.packsLoaded.length) {
-    lines.push(`  packs:   ${prep.runtime.packsLoaded.slice(0, 12).join(', ')}${prep.runtime.packsLoaded.length > 12 ? ', …' : ''}`);
-  }
-  return lines.join('\n');
-}
-
 function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max - 1) + '…' : s;
 }
@@ -2664,122 +2623,6 @@ function walkDotPath(obj: unknown, path: string): unknown {
   }
   return cur;
 }
-
-/**
- * Static protocol-teaching block prepended to every dispatch. Byte-stable
- * — never includes timestamps or per-Turn drift. Cache-friendly per
- * state-advancement-loop §9.
- *
- * v1 vocabulary: `<b:s>` only. File-op tags (`<b:f>`, `<b:fu>`, `<b:fc>`,
- * `<b:fw>`) are reserved by the spec but unimplemented in v1; the model
- * is not told about them yet to avoid confusing it with unsupported syntax.
- */
-const PROTOCOL_TEACHING_BLOCK = [
-  '[Blur protocol — read once, apply each reply]',
-  '',
-  'You operate inside the Blur runtime. Two tags let you advance state:',
-  '',
-  '  <b:p e="<kind>:<id>">field.path</b:p>  — READ a field from one',
-  '    entity record. Fast, host-side, no script execution. Preferred',
-  '    for simple reads. Known kinds:',
-  '      project, ticket, decision, engagement, agent, turn',
-  '    Examples:',
-  '      <b:p e="project:qb">label</b:p>',
-  '      <b:p e="project:blur-project-framework">charter.definition.title</b:p>',
-  '      <b:p e="ticket:tkt_abc">title</b:p>',
-  '    Body is a dot-path (with optional [i] indexing). Empty body =',
-  '    return the whole record.',
-  '',
-  '  <b:s>code</b:s>                         — execute a JavaScript /',
-  '    TypeScript snippet via `runtime.script.run`. Use when `<b:p>`',
-  '    is insufficient: computed values, multi-step reads, mutations,',
-  '    audit-event queries, etc. Async; you may `await` and `return`.',
-  '    The runtime object is in scope as `runtime`.',
-  '    Example primitives: `runtime.projects.list({...})`,',
-  '    `runtime.tickets.list({...})`, `runtime.audit.recentEvents({...})`.',
-  '    For mutations, use the write primitives directly inside the script.',
-  '',
-  'The substrate parses every tag, executes it, and appends each result',
-  'as `<b:p-result for="$N">…</b:p-result>` / `<b:s-result for="$N">…</b:s-result>`',
-  '(or the matching `-error` variant) to a follow-up message. You can',
-  'read those results and decide what to do next.',
-  '',
-  'Tag syntax (precise — small variations break execution):',
-  '  <b:p e="kind:id">path</b:p>              — property read',
-  '  <b:s>code</b:s>                          — execute code',
-  '  <b:s isolate="hermetic">code</b:s>       — fresh isolate for this block',
-  '',
-  'Do NOT write `<b:s-isolate=…>`, `<b:script>`, `<bs>`, `<b-p>` or',
-  'similar variants — those forms are not recognized. Opening tags',
-  'are exactly `<b:s` or `<b:p` optionally followed by attributes,',
-  'then `>`.',
-  '',
-  'You emit ONLY the call tags: `<b:p>` and `<b:s>`. You do NOT write',
-  '`<b:p-result>`, `<b:s-result>`, `<b:p-error>`, or `<b:s-error>` —',
-  'those are reserved for the substrate. The substrate appends them to',
-  'your next prefix after running your call. If you write a result tag',
-  'yourself, the substrate ignores it but the model on the next iteration',
-  '(you) sees two result tags side by side and gets confused. Don\'t.',
-  '',
-  'If you already wrote a complete natural-language answer to the user',
-  'BEFORE you saw the result of your tag — and the result confirms your',
-  'answer — produce a tag-free reply on the next iteration to terminate',
-  'the Turn. A brief acknowledgment like "Confirmed." is fine. Do NOT',
-  'meta-narrate the protocol ("The Turn ends with your plain prose…");',
-  'just answer or acknowledge and stop.',
-  '',
-  'Rules:',
-  '  - Multiple tags in one reply run in source order; positions are',
-  '    numbered across all kinds (so `<b:p>` then `<b:s>` means $1 and',
-  '    $2). Within a Turn, `<b:s>` blocks share scope (variables in',
-  '    block 1 are visible in block 2). Opt out with',
-  '    `<b:s isolate="hermetic">…</b:s>`.',
-  '  - A reply with **zero** tags ends the Turn. The substrate treats',
-  '    your reply as the final answer to the user.',
-  '  - The substrate caps the loop at 64 iterations per Turn; emit a',
-  '    tag-free reply when you have what you need.',
-  '  - You may wrap tags in markdown ``` fences or not — both forms',
-  '    execute. Tags are matched anywhere in your reply.',
-  '',
-  'Interpreting `<b:s-result>` bodies:',
-  '  - JSON-shaped content → the script returned an object or array.',
-  '  - A bare value (string, number, true/false, null) → that value.',
-  '  - `(undefined — script returned no value)` → the script ran',
-  '    successfully but returned undefined. NOT an error. Most often',
-  '    you read a field that doesn\'t exist (the path was wrong) or you',
-  '    forgot to `return` in your snippet. Try a different path or add',
-  '    `return`. Do NOT claim "an error occurred" — there was no error.',
-  '  - `(empty string)` → the script returned "". Also not an error.',
-  '  - A `<b:s-error>` tag is the ONLY error signal. If you don\'t see',
-  '    one, the script worked.',
-  '',
-  'When a field path returns undefined, the right move is to inspect',
-  'the record shape, not to guess again. Example:',
-  '  <b:s>const p = await runtime.projects.get("blur-project-framework");',
-  '       return { keys: Object.keys(p), sample: p };</b:s>',
-  'Then read where the field actually lives and try again.',
-  '',
-  'Workflow you typically follow:',
-  '  1. Read whatever state matters. Prefer `<b:p>` for single-field',
-  '     reads: `<b:p e="project:qb">label</b:p>`. Use `<b:s>` for',
-  '     anything that needs computation, multiple fetches, or writes.',
-  '  2. The substrate executes; you see a `<b:p-result>` or',
-  '     `<b:s-result>` block with the value.',
-  '  3. Reason about the result. If you need more, emit another tag.',
-  '  4. When you have enough to answer the user, write the answer as',
-  '     plain prose with **no** tags. Turn ends.',
-  '',
-  'A common first-Turn move:',
-  '  user: "what is the label of this project?"',
-  '  you:  `<b:p e="project:blur-project-framework">label</b:p>`',
-  '  (substrate runs it, appends the result)',
-  '  you again: "The label is: …" (no tags — Turn ends.)',
-  '',
-  'If you read a path that doesn\'t exist, you\'ll see a `<b:p-error>`',
-  'telling you what went wrong. To inspect a record\'s shape, read it',
-  'with no path: `<b:p e="project:qb"></b:p>` returns the whole record.',
-  '',
-].join('\n');
 
 function cloneLinkedOutput(o: LinkedOutput): LinkedOutput {
   return { ...o };
