@@ -74,6 +74,25 @@ interface GenericResolverSpec {
 }
 
 /**
+ * One delta entry buffered for inclusion in Layer 4 of the layered
+ * prefix. Decision 37 §9.
+ *
+ * - `Δ` form: a snapshot field's value changed
+ * - `+` form: a new entity appeared (filed, opened, created)
+ *
+ * Rendered as a single line; chronologically interleaved with Turn
+ * pairs in the chronological tail.
+ */
+interface DeltaEntry {
+  /** Microsecond-precision timestamp (ISO + tail) for chronological ordering. */
+  at: string;
+  /** 'Δ' for value-diff; '+' for new-entity-append. */
+  marker: 'Δ' | '+';
+  /** Pre-rendered line body, e.g. "ticket.status[tkt_abc]: open → resolved". */
+  body: string;
+}
+
+/**
  * Parse a comma-separated `filter="key:value,key:value"` attribute into
  * an opts object. Keys outside the optional `allowedKeys` whitelist are
  * dropped (the walker declares allowed filters per entity).
@@ -247,6 +266,55 @@ export class EngagementFlowSubsystem implements Persistable {
   /** Hard cap on iterations per script-loop chain. */
   private static SCRIPT_LOOP_CAP = 64;
 
+  // -------------------------------------------------------------------------
+  // Delta-tail projection (Decision 37 §9 + design conversation)
+  //
+  // Per-engagement buffer of entity-mutation deltas observed since the
+  // last user-initiated Turn. Subscribers on `tickets.*`, `decisions.*`,
+  // `projects.*` etc. classify each event as Δ (value-diff for a snapshot
+  // field) or + (new entity creation). On the next user-initiated
+  // dispatch, accumulated deltas are spliced into Layer 4 (chronological
+  // tail) chronologically alongside the prior Turn pair, then drained.
+  //
+  // Cache discipline: each Turn's tail grows by the new delta block AND
+  // the new Turn pair. The byte-stable upper prefix (Layers 1A-3) doesn't
+  // rebuild — providers' KV cache hits everything above the new tail.
+  // -------------------------------------------------------------------------
+  /** Per-engagement buffered deltas, awaiting the next user-initiated dispatch. */
+  private deltasByEng = new Map<string, DeltaEntry[]>();
+  /** Hard cap on per-engagement buffer so a runaway mutation stream doesn't OOM. */
+  private static DELTA_BUFFER_CAP = 200;
+
+  /**
+   * Audit kinds the delta-tail subscriber listens to. Curated set —
+   * pack authors that want their entity's mutations to surface as deltas
+   * for the model add their kinds here (or, future, via a pack-declared
+   * delta-projection hook).
+   */
+  private static DELTA_AUDIT_KINDS: string[] = [
+    // Tickets
+    'tickets.filed',
+    'tickets.updated',
+    'tickets.resolved',
+    'tickets.closed',
+    'tickets.wont-fix',
+    'tickets.reopened',
+    // Decisions
+    'decisions.opened',
+    'decisions.resolved',
+    'decisions.deferred',
+    'decisions.dropped',
+    // Projects
+    'projects.directionSet',
+    'projects.charterDefinitionSet',
+    'projects.updated',
+    // Engagements (self-referential — the engagement seeing its own
+    // status changes is useful context for restart/resume)
+    'engagements.runtime-model-set',
+    'engagements.runtime-model-cleared',
+    'engagements.output-added',
+  ];
+
   /**
    * Activities whose user-initiated Turns get prior-Turn history appended
    * to the prefix on dispatch. See `assemblePriorChainPrefix` for the
@@ -341,6 +409,17 @@ export class EngagementFlowSubsystem implements Persistable {
         void this.onTurnCompletedForScriptLoop(e);
       }),
     );
+
+    // Decision 37 — delta-tail projection (Layer 4 of the layered prefix).
+    // Subscribe to entity-mutation audits and classify each into Δ/+ lines
+    // buffered per-engagement, awaiting the next user-initiated dispatch.
+    // Scope filter inside onMutationForDelta narrows to entities that
+    // intersect each active engagement's snapshot scope.
+    for (const kind of EngagementFlowSubsystem.DELTA_AUDIT_KINDS) {
+      this.unsubs.push(
+        audit.subscribe(kind, (e) => this.onMutationForDelta(kind, e)),
+      );
+    }
 
     // Rebuild the turnId→engagementId index from the durable store so
     // pack reloads don't drop the cache. The script-loop subscriber
@@ -672,6 +751,230 @@ export class EngagementFlowSubsystem implements Persistable {
     } catch (err) {
       return { ok: false, error: (err as Error)?.message ?? String(err) };
     }
+  }
+
+  /**
+   * Audit subscriber for entity-mutation events (Decision 37 §9 delta
+   * tail). Classifies each event as Δ (value-diff) or + (new entity)
+   * and appends to the per-engagement buffer for every currently-active
+   * engagement whose snapshot scope intersects the mutation's entity.
+   *
+   * Scope filter (v1, conservative): match if the affected entity's
+   * `project` / `projectId` carries an engagement's scope.ref. Project-
+   * scoped engagements see only their own project's mutations; cross-
+   * project engagements (future PM agent) see everything.
+   */
+  private onMutationForDelta(kind: string, event: SemanticEventLike): void {
+    try {
+      const data = (event.data ?? {}) as Record<string, unknown>;
+      const at = event.at ?? new Date().toISOString();
+      const projectRef = this.extractProjectFromMutation(kind, data);
+      const classified = this.classifyMutation(kind, data);
+      if (!classified) return;
+      const entry: DeltaEntry = { at, marker: classified.marker, body: classified.body };
+
+      // Fan out to every active engagement whose scope matches.
+      const engagementsApi = this.resolveEngagements() as
+        | { list?: (opts: { status?: string }) => unknown }
+        | null;
+      const active = engagementsApi?.list?.({ status: 'active' });
+      if (!Array.isArray(active)) return;
+      for (const engRaw of active) {
+        const eng = engRaw as { id?: string; scope?: { kind?: string; ref?: string } };
+        if (!eng.id) continue;
+        if (!this.engagementMatchesScope(eng, projectRef)) continue;
+        this.bufferDelta(eng.id, entry);
+      }
+    } catch (err) {
+      // Never let a delta-classifier exception crash the audit pipeline.
+      this.runtime.audit?.appendEvent?.('engagement_flow_delta_error', {
+        kind,
+        error: (err as Error)?.message ?? String(err),
+      });
+    }
+  }
+
+  /**
+   * Try to extract the project id this mutation belongs to. Returns null
+   * if the event isn't project-scoped (then the scope filter falls back
+   * to looser matching). v1 inspects common field names; pack-declared
+   * scope rules are a v2 surface.
+   */
+  private extractProjectFromMutation(
+    kind: string,
+    data: Record<string, unknown>,
+  ): string | null {
+    // Direct fields packs use today
+    const candidates: Array<unknown> = [
+      data.project,
+      data.projectId,
+      (data.scope as { ref?: unknown } | undefined)?.ref,
+    ];
+    for (const c of candidates) {
+      if (typeof c === 'string' && c.length > 0) return c;
+    }
+    // For projects.* events, the entity ref itself is the project id
+    if (kind.startsWith('projects.')) {
+      const id = data.id ?? data.projectId;
+      if (typeof id === 'string') return id;
+    }
+    return null;
+  }
+
+  /**
+   * Map a mutation event to a rendered delta line. Returns null for
+   * events that don't warrant a tail entry (already-handled fan-out,
+   * informational-only events, etc.).
+   */
+  private classifyMutation(
+    kind: string,
+    data: Record<string, unknown>,
+  ): { marker: 'Δ' | '+'; body: string } | null {
+    // Tickets
+    if (kind === 'tickets.filed') {
+      const id = String(data.id ?? data.ticketId ?? '?');
+      const title = truncate(String(data.title ?? ''), 60);
+      return { marker: '+', body: `ticket.filed: ${id}${title ? ` "${title}"` : ''}` };
+    }
+    if (kind === 'tickets.updated') {
+      const id = String(data.id ?? data.ticketId ?? '?');
+      const patch = data.patch as Record<string, unknown> | undefined;
+      const fields = patch ? Object.keys(patch).join(', ') : 'fields';
+      return { marker: 'Δ', body: `ticket.${fields}[${id}]: updated` };
+    }
+    if (
+      kind === 'tickets.resolved' || kind === 'tickets.closed' ||
+      kind === 'tickets.wont-fix' || kind === 'tickets.reopened'
+    ) {
+      const id = String(data.id ?? data.ticketId ?? '?');
+      const status = kind.slice('tickets.'.length);  // 'resolved' / 'closed' / 'wont-fix' / 'reopened'
+      const newStatus = status === 'reopened' ? 'open' : status;
+      return { marker: 'Δ', body: `ticket.status[${id}]: → ${newStatus}` };
+    }
+    // Decisions
+    if (kind === 'decisions.opened') {
+      const id = String(data.id ?? data.decisionId ?? '?');
+      const question = truncate(String(data.question ?? ''), 60);
+      return { marker: '+', body: `decision.opened: ${id}${question ? ` "${question}"` : ''}` };
+    }
+    if (
+      kind === 'decisions.resolved' || kind === 'decisions.deferred' ||
+      kind === 'decisions.dropped'
+    ) {
+      const id = String(data.id ?? data.decisionId ?? '?');
+      const status = kind.slice('decisions.'.length);
+      return { marker: 'Δ', body: `decision.status[${id}]: → ${status}` };
+    }
+    // Projects
+    if (kind === 'projects.directionSet') {
+      const id = String(data.id ?? data.projectId ?? '?');
+      const direction = data.direction as { northStar?: unknown; target?: unknown } | undefined;
+      const ns = direction?.northStar ? truncate(String(direction.northStar), 80) : null;
+      return {
+        marker: 'Δ',
+        body: ns
+          ? `project.direction.northStar[${id}]: → "${ns}"`
+          : `project.direction[${id}]: updated`,
+      };
+    }
+    if (kind === 'projects.charterDefinitionSet') {
+      const id = String(data.id ?? data.projectId ?? '?');
+      return { marker: 'Δ', body: `project.charter.definition[${id}]: updated` };
+    }
+    if (kind === 'projects.updated') {
+      const id = String(data.id ?? data.projectId ?? '?');
+      const patch = data.patch as Record<string, unknown> | undefined;
+      const fields = patch ? Object.keys(patch).join(', ') : 'fields';
+      return { marker: 'Δ', body: `project.${fields}[${id}]: updated` };
+    }
+    // Engagements (self-referential)
+    if (kind === 'engagements.runtime-model-set') {
+      const id = String(data.id ?? data.engagementId ?? '?');
+      const model = truncate(String(data.modelRef ?? ''), 40);
+      return { marker: 'Δ', body: `engagement.runtimeModel[${id}]: → ${model}` };
+    }
+    if (kind === 'engagements.runtime-model-cleared') {
+      const id = String(data.id ?? data.engagementId ?? '?');
+      return { marker: 'Δ', body: `engagement.runtimeModel[${id}]: cleared` };
+    }
+    if (kind === 'engagements.output-added') {
+      const out = data.output as { kind?: string; ref?: string; label?: string } | undefined;
+      if (!out) return null;
+      const label = out.label ? ` "${truncate(out.label, 50)}"` : '';
+      return { marker: '+', body: `engagement.output: ${out.kind}:${out.ref}${label}` };
+    }
+    return null;
+  }
+
+  /**
+   * Does this engagement's snapshot scope include the mutation's project?
+   * v1: project-scoped engagements match same-project mutations; other
+   * scopes match nothing (until cross-project engagements ship in v1.5).
+   *
+   * Returns true also when projectRef is null AND engagement scope is
+   * 'none' — both unbound; safe to include.
+   */
+  private engagementMatchesScope(
+    engagement: { scope?: { kind?: string; ref?: string } },
+    projectRef: string | null,
+  ): boolean {
+    const scope = engagement.scope;
+    if (!scope) return false;
+    if (scope.kind === 'project') {
+      return !!projectRef && scope.ref === projectRef;
+    }
+    if (scope.kind === 'none') {
+      return projectRef === null;
+    }
+    // Other scopes (tool, workspace, future portfolio) — v1 conservative skip.
+    return false;
+  }
+
+  /** Append a delta to the per-engagement buffer with cap enforcement. */
+  private bufferDelta(engagementId: string, entry: DeltaEntry): void {
+    const list = this.deltasByEng.get(engagementId) ?? [];
+    list.push(entry);
+    // Cap by trimming the oldest — runaway mutation streams can't OOM.
+    if (list.length > EngagementFlowSubsystem.DELTA_BUFFER_CAP) {
+      list.splice(0, list.length - EngagementFlowSubsystem.DELTA_BUFFER_CAP);
+    }
+    this.deltasByEng.set(engagementId, list);
+    this._dirty = true;
+  }
+
+  /**
+   * Drain the per-engagement delta buffer, returning a rendered text
+   * block of all accumulated entries (or null when empty). Called by
+   * `assemblePriorChainPrefix` when stitching the chronological tail
+   * for a user-initiated Turn. Deltas become part of the byte-stable
+   * prior chain on the next Turn, so they aren't repeated.
+   */
+  private drainDeltas(engagementId: string): string | null {
+    const list = this.deltasByEng.get(engagementId);
+    if (!list || list.length === 0) return null;
+    this.deltasByEng.delete(engagementId);
+    this._dirty = true;
+    // Sort by timestamp (defensive — events should arrive in order but
+    // out-of-order is possible if multiple sources fire near-simultaneously).
+    list.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+    const lines = list.map(d => `${d.marker} ${d.body} at ${d.at}`);
+    return lines.join('\n');
+  }
+
+  /**
+   * Snapshot of currently-buffered deltas across all engagements. Read-
+   * only diagnostic — exposed via inspectScriptLoopState() in spirit
+   * (the analogous "look at what's accumulated" surface).
+   */
+  inspectDeltaBuffers(): Record<string, { count: number; sample: DeltaEntry[] }> {
+    const out: Record<string, { count: number; sample: DeltaEntry[] }> = {};
+    for (const [engId, list] of this.deltasByEng) {
+      out[engId] = {
+        count: list.length,
+        sample: list.slice(0, 5).map(d => ({ ...d })),
+      };
+    }
+    return out;
   }
 
   /**
@@ -1743,7 +2046,19 @@ export class EngagementFlowSubsystem implements Persistable {
     const priorRequestText = lastTurn.request?.text ?? '';
     if (!priorRequestText) return null;
     const priorReplyText = lastTurn.assembledText ?? '';
-    return priorRequestText + (priorReplyText ? '\n\n' + priorReplyText : '');
+
+    // Decision 37 §9 — drain any accumulated entity-mutation deltas and
+    // append them after the prior Turn pair. Deltas become part of the
+    // byte-stable prior chain on the next dispatch so they aren't
+    // repeated; KV cache stays warm for the whole accumulated tail.
+    const deltaBlock = this.drainDeltas(engagementId);
+
+    const parts: string[] = [priorRequestText];
+    if (priorReplyText) parts.push(priorReplyText);
+    if (deltaBlock) {
+      parts.push('[DELTA — runtime changes since prior Turn]\n' + deltaBlock);
+    }
+    return parts.join('\n\n');
   }
 
   /**
