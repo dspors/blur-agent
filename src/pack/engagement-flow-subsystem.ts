@@ -2189,12 +2189,23 @@ export class EngagementFlowSubsystem implements Persistable {
       }
       this.scriptLoopIterations.set(engagementId, iter);
 
-      // Locate the script runner for `<b:s>` tags. `<b:p>` doesn't need
+      // Locate the script host for `<b:s>` tags. `<b:p>` doesn't need
       // it (host-side resolver bypasses the script isolate). Only bail
-      // per-tag if `<b:s>` appears and the runner is missing.
-      const scriptRunner = (this.runtime as unknown as {
-        script?: { run?: (src: string) => Promise<{ value?: unknown; ok?: boolean; error?: string }> };
-      }).script?.run;
+      // per-tag if `<b:s>` appears and the host is missing.
+      //
+      // We keep the parent `script` object (not just the bare `.run`
+      // function) so the eventual call preserves `this` binding —
+      // `runtime.script.run` is implemented as a method that reads
+      // private fields (`this.runtimeRef`, etc.) off the script host.
+      // Destructuring to a bare function reference and invoking it
+      // (`fn(body)`) loses `this`, surfacing as
+      // "Cannot read properties of undefined (reading 'runtimeRef')"
+      // when the method tries to access its host's state. See tkt_9bc4e005.
+      const scriptHost = (this.runtime as unknown as {
+        script?: {
+          run?: (src: string) => Promise<{ value?: unknown; ok?: boolean; error?: string }>;
+        };
+      }).script;
 
       this.emit('turns.iteration-started', `item:engagements[${engagementId}]`, {
         engagementId,
@@ -2215,9 +2226,11 @@ export class EngagementFlowSubsystem implements Persistable {
         try {
           let r: { ok?: boolean; value?: unknown; error?: string };
           if (tag.kind === 'b:script' || tag.kind === 'b:s') {
-            // Script escape hatch.
-            if (typeof scriptRunner === 'function') {
-              r = await scriptRunner(tag.body);
+            // Script escape hatch. Call through `scriptHost.run(...)` so
+            // `this` binds correctly inside the runner (see scriptHost
+            // declaration above + tkt_9bc4e005).
+            if (scriptHost && typeof scriptHost.run === 'function') {
+              r = await scriptHost.run(tag.body);
             } else {
               r = { ok: false, error: 'runtime.script.run unavailable on host' };
             }
