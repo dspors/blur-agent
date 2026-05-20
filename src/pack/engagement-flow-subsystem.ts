@@ -897,6 +897,14 @@ export class EngagementFlowSubsystem implements Persistable {
       modelRefs: string[];
       by?: string;
       outcome?: string;
+      /**
+       * Bypass the Blur prefix entirely for every per-model dispatch.
+       * Forwarded to `dispatchTurn({ rawPrompt: true })`. See that
+       * method's docs for caveats. Intended for testing infrastructure
+       * (prompt A/B benchmarks, model-comparison runs where prefix
+       * bytes should not contaminate the result).
+       */
+      rawPrompt?: boolean;
     },
   ): Promise<{
     engagementId: string;
@@ -931,6 +939,7 @@ export class EngagementFlowSubsystem implements Persistable {
           pin: modelRef,
           by: opts.by ?? `dispatchToModels:${modelRef}`,
           ...(opts.outcome ? { outcome: opts.outcome } : {}),
+          ...(opts.rawPrompt ? { rawPrompt: true } : {}),
         });
         results.push({
           modelRef,
@@ -1883,6 +1892,24 @@ export class EngagementFlowSubsystem implements Persistable {
        * `onTurnCompletedForScriptLoop` handler when continuing a chain.
        */
       skipPrepSplice?: boolean;
+      /**
+       * Raw-prompt mode — bypass ALL prefix layers entirely. When true,
+       * `opts.text` is dispatched verbatim with no Blur prefix
+       * (Layer 1A/1B/1C/2/3) prepended and no history append.
+       *
+       * Intended for testing infrastructure (compare-models workbench,
+       * prompt A/B benchmarks) where the caller needs 100% control over
+       * the model's input. NOT for production agent dispatch — without
+       * the prefix the model has no awareness of Blur context, no
+       * `<b:*>` tag teaching, no project/role grounding. Iteration
+       * chains still fire if the model emits b:* tags, but the chain
+       * continuations will also dispatch raw (no prefix on iter-2+
+       * either), so use sparingly.
+       *
+       * Takes precedence over `skipPrepSplice` and the history-append
+       * path. `prepSpliced` is reported false. See tkt for context.
+       */
+      rawPrompt?: boolean;
     } = { text: '' },
   ): Promise<{
     turnId: string;
@@ -1953,7 +1980,14 @@ export class EngagementFlowSubsystem implements Persistable {
     let finalText: string;
     let prepSplicedThisTurn: boolean;
 
-    if (opts.skipPrepSplice) {
+    if (opts.rawPrompt) {
+      // Path 0 — raw-prompt mode. Caller wants 100% control over the
+      // model's input; no Blur prefix, no history. Used by testing
+      // infrastructure (compare-models workbench) for prompt-quality
+      // comparison runs. Takes precedence over skipPrepSplice.
+      finalText = opts.text;
+      prepSplicedThisTurn = false;
+    } else if (opts.skipPrepSplice) {
       // Path 1 — script-loop continuation. opts.text is the full follow-up.
       finalText = opts.text;
       prepSplicedThisTurn = false;
