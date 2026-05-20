@@ -309,6 +309,21 @@ export class EngagementFlowSubsystem implements Persistable {
   private turnToEngagement = new Map<string, string>();
   /** Per-engagement remembered prior-iteration prompt — feeds the next iter's prefix. */
   private lastDispatchedPromptByEng = new Map<string, string>();
+  /**
+   * Map turnId → rootTurnId for the script-loop iteration chain that
+   * contains it (tkt_7de641e6). For iter-1 (fresh user-dispatched
+   * turn that emits tags), rootTurnId IS turnId. For iter-N (N>1),
+   * rootTurnId is the iter-1 turn that originated the chain.
+   *
+   * Used to propagate chain identity in `turns.iteration-started`
+   * audit events so UI subscribers can correlate continuations to
+   * their originating dispatch — critical for dispatchToModels-style
+   * fan-out where N parallel chains share one engagement+agent and
+   * cannot be disambiguated by engagementId or agentId alone.
+   *
+   * Cleared when the chain terminates (script-free reply or cap).
+   */
+  private chainRootByTurnId = new Map<string, string>();
   /** Hard cap on iterations per script-loop chain. */
   private static SCRIPT_LOOP_CAP = 64;
 
@@ -2200,16 +2215,20 @@ export class EngagementFlowSubsystem implements Persistable {
       };
 
       // No tags → chain terminates naturally. Record stats + bail.
+      // Drop the chainRoot entry for this turn (chain is over —
+      // continuation won't be dispatched). tkt_7de641e6.
       if (tags.length === 0) {
         this.scriptLoopIterations.delete(engagementId);
+        this.chainRootByTurnId.delete(turnId);
         stats.terminationReason = 'script-free';
         this.recordTurnStats(stats);
         return;
       }
 
-      // Cap enforcement.
+      // Cap enforcement. Same cleanup as termination above.
       if (iter > EngagementFlowSubsystem.SCRIPT_LOOP_CAP) {
         this.scriptLoopIterations.delete(engagementId);
+        this.chainRootByTurnId.delete(turnId);
         stats.terminationReason = 'cap-reached';
         this.recordTurnStats(stats);
         this.emit('turns.iteration-cap-reached', `item:engagements[${engagementId}]`, {
@@ -2241,9 +2260,20 @@ export class EngagementFlowSubsystem implements Persistable {
         };
       }).script;
 
+      // rootTurnId = the iter-1 turn that originated this chain. For
+      // iter-1 itself, the turn IS its own root; record it. For iter-N
+      // (N>1), look up the parent linkage recorded by the previous
+      // iteration's continuation-dispatch step (below).
+      let rootTurnId = this.chainRootByTurnId.get(turnId);
+      if (!rootTurnId) {
+        rootTurnId = turnId;
+        this.chainRootByTurnId.set(turnId, rootTurnId);
+      }
+
       this.emit('turns.iteration-started', `item:engagements[${engagementId}]`, {
         engagementId,
         turnId,
+        rootTurnId,  // tkt_7de641e6 — chain identity for dispatchToModels fan-out
         iter,
         tagCount: tags.length,
         at: new Date().toISOString(),
@@ -2326,15 +2356,23 @@ export class EngagementFlowSubsystem implements Persistable {
         '\n\n' + replyText +
         '\n\n' + resultBlocks.join('\n\n');
 
-      await this.dispatchTurn(engagementId, {
+      const continuation = await this.dispatchTurn(engagementId, {
         text: followUp,
         by: 'script-loop',
         skipPrepSplice: true,
       });
 
+      // Propagate the chain's root identity to the new iter-N+1 turn
+      // so the next iteration emits the same rootTurnId in its
+      // iteration-started event. tkt_7de641e6.
+      if (continuation && continuation.turnId) {
+        this.chainRootByTurnId.set(continuation.turnId, rootTurnId);
+      }
+
       this.emit('turns.iteration-completed', `item:engagements[${engagementId}]`, {
         engagementId,
         turnId,
+        rootTurnId,  // chain identity propagated for symmetry with iteration-started
         iter,
         tagCount: tags.length,
         scriptExecMs: stats.scriptExecMs,
