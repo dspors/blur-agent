@@ -30,6 +30,8 @@ import { TurnsSubsystem } from './turns-subsystem';
 import { SchedulerSubsystem } from './scheduler-subsystem';
 import { ProviderRegistry } from './provider-registry';
 import { EngagementFlowSubsystem } from './engagement-flow-subsystem';
+import { ChatCompletionsSubsystem } from './chat-completions-subsystem';
+import { BlurContext, type BlurContextSnapshot, type FromActivityOpts } from './blur-context';
 import { RunSubsystem } from './run-subsystem';
 import { SecretarySubsystem } from './secretary-subsystem';
 import { bridgeProviderImpl } from './providers/bridge-provider';
@@ -40,6 +42,7 @@ import { schedulerExposures } from './scheduler-exposures';
 import { engagementFlowExposures } from './engagement-flow-exposures';
 import { runExposures } from './run-exposures';
 import { secretaryExposures } from './secretary-exposures';
+import { chatCompletionsExposures, contextExposures } from './chat-completions-exposures';
 
 export { AgentsSubsystem } from './agents-subsystem';
 export { AgentRepliesSubsystem } from './replies-subsystem';
@@ -47,6 +50,22 @@ export { TurnsSubsystem } from './turns-subsystem';
 export { SchedulerSubsystem } from './scheduler-subsystem';
 export { ProviderRegistry } from './provider-registry';
 export { EngagementFlowSubsystem } from './engagement-flow-subsystem';
+export { ChatCompletionsSubsystem } from './chat-completions-subsystem';
+export { BlurContext } from './blur-context';
+export type {
+  BlurContextSnapshot,
+  ChatMessage,
+  LayerName,
+  FromActivityOpts,
+  BlurContextDescription,
+} from './blur-context';
+export type {
+  ModelSpec,
+  ToolDef,
+  CreateOpts,
+  IterationRecord,
+  ChainResult,
+} from './chat-completions-subsystem';
 export { LiveReply } from './live-reply';
 export type {
   EngagementFlowOptions,
@@ -221,6 +240,7 @@ const pack: LibraryPack = {
     const scheduler = new SchedulerSubsystem(runtime);
     const providers = new ProviderRegistry();
     const engagementFlow = new EngagementFlowSubsystem(runtime);
+    const chatCompletions = new ChatCompletionsSubsystem(runtime);
     const runners = new RunSubsystem();
     const secretary = new SecretarySubsystem();
     runners.attachRuntime(runtime);
@@ -258,6 +278,12 @@ const pack: LibraryPack = {
     // dispatchTurn routes through scheduler.requestTurn (Decision 34).
     engagementFlow.agentsRef = agents;
     engagementFlow.schedulerRef = scheduler;
+
+    // chat.completions (Decision 34) calls the provider registry
+    // directly + long-polls via replies subsystem. No agent, no
+    // engagement — each chain is self-contained.
+    chatCompletions.providerRegistry = providers;
+    chatCompletions.repliesRef = replies;
 
     // Register built-in providers. mock is fully functional; bridge
     // requires the cowork-web-bridge runtime-pack to be loaded for
@@ -335,14 +361,47 @@ const pack: LibraryPack = {
       agents, replies, turns, scheduler, engagementFlow,
     });
 
+    // Context factory — exposes BlurContext static factories via the
+    // script-facing surface as `runtime.context.fromActivity(...)`.
+    // Returns plain-data snapshots because V8 isolates don't
+    // round-trip class instances. The chat.completions subsystem
+    // accepts either the live class instance OR a snapshot.
+    const contextFactory = {
+      async fromActivity(opts: Omit<FromActivityOpts, 'runtime'>): Promise<BlurContextSnapshot> {
+        const ctx = await BlurContext.fromActivity({ runtime, ...opts });
+        return ctx.toSnapshot();
+      },
+      fromScratch(): BlurContextSnapshot {
+        return BlurContext.fromScratch().toSnapshot();
+      },
+      fromComposed(rawText: string): BlurContextSnapshot {
+        return BlurContext.fromComposed(rawText).toSnapshot();
+      },
+      describe(snapshot: BlurContextSnapshot) {
+        return BlurContext.fromSnapshot(snapshot).describe();
+      },
+    };
+
+    // `chat` namespace with `.completions` as the subsystem instance.
+    // resolveObjectPath('chat.completions') walks runtime.extensions.chat
+    // then .completions, landing on this instance.
+    const chat = { completions: chatCompletions };
+
     return {
-      objects: { agents, replies, turns, scheduler, providers, engagementFlow, runners, secretary },
+      objects: {
+        agents, replies, turns, scheduler, providers, engagementFlow, runners, secretary,
+        // Decision 34 — chat-completions primitive + context factory.
+        chat,
+        context: contextFactory,
+      },
       exposures: [
         ...exposures,
         ...schedulerExposures,
         ...engagementFlowExposures,
         ...runExposures,
         ...secretaryExposures,
+        ...chatCompletionsExposures,
+        ...contextExposures,
         // Per-provider exposures (Decision 29 escape-hatch pattern).
         // Mounted under runtime.agents.providers.<kind>.*. Today none
         // of the built-in providers ship custom exposures; this picks
