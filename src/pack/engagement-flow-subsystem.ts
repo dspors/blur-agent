@@ -524,7 +524,13 @@ export class EngagementFlowSubsystem implements Persistable {
    * shaped like a script result so the script-loop handler can splice
    * it the same way.
    */
-  private async resolveBPTag(tag: import('./b-tags').BTag): Promise<{
+  /**
+   * Legacy `<b:p>` property-read tag. Decision 37 marks it deprecated
+   * but kept functional during migration. Made public alongside
+   * resolveGenericTag so chat-completions has full dispatch parity
+   * (Decision 34).
+   */
+  async resolveBPTag(tag: import('./b-tags').BTag): Promise<{
     ok: boolean;
     value?: unknown;
     error?: string;

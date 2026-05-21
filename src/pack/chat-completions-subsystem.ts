@@ -537,23 +537,36 @@ export class ChatCompletionsSubsystem {
       return scriptHost.run(tag.body);
     }
 
-    // Descriptive tag (Decision 37) — delegate to engagement-flow's
-    // resolveGenericTag which owns the dispatch by action attribute
-    // (read/list/count/update/invoke) + walker resolver-map lookup.
-    // Decision 34 keeps chat.completions independent of engagement
-    // SEMANTICS (no agent, no history, no audit) but leans on
-    // engagement-flow for the entity-tag execution machinery — the
-    // walker integration is single-source-of-truth there. A future
-    // refactor can extract that helper into a free function.
-    // Look up via runtime.extensions (the script-isolate-facing
-    // surface mounts objects there; direct `runtime.engagementFlow`
-    // isn't a property on the substrate-side reference).
+    // Engagement-flow owns the b:p (legacy property-read) and
+    // descriptive entity-tag resolvers. We delegate to keep walker
+    // integration single-source-of-truth there. Decision 34 keeps
+    // chat.completions independent of engagement SEMANTICS (no agent,
+    // no history, no audit), only borrows the tag-execution machinery.
+    // Look up via runtime.extensions (the substrate-side reference
+    // doesn't have `runtime.engagementFlow` as a direct property).
     const extensions = (this.runtime as unknown as {
       extensions?: { get?: (name: string) => unknown };
     }).extensions;
     const engagementFlow = extensions?.get?.('engagementFlow') as
-      | { resolveGenericTag?: (tag: BTag) => Promise<{ ok?: boolean; value?: unknown; error?: string }> }
+      | {
+          resolveGenericTag?: (tag: BTag) => Promise<{ ok?: boolean; value?: unknown; error?: string }>;
+          resolveBPTag?: (tag: BTag) => Promise<{ ok?: boolean; value?: unknown; error?: string }>;
+        }
       | undefined;
+
+    // Legacy b:p — property-read shape (deprecated per Decision 37 but
+    // kept functional during migration). Must dispatch BEFORE the
+    // generic walker resolver, otherwise b:p falls through to the
+    // "unknown entity tag" path.
+    if (tag.kind === 'b:p') {
+      if (engagementFlow && typeof engagementFlow.resolveBPTag === 'function') {
+        return engagementFlow.resolveBPTag(tag);
+      }
+      return { ok: false, error: 'chat.completions: <b:p> requires runtime.engagementFlow.resolveBPTag (unavailable)' };
+    }
+
+    // Descriptive tag (Decision 37) — dispatch by action attribute
+    // via walker resolver map.
     if (engagementFlow && typeof engagementFlow.resolveGenericTag === 'function') {
       return engagementFlow.resolveGenericTag(tag);
     }
