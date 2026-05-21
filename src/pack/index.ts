@@ -32,6 +32,7 @@ import { ProviderRegistry } from './provider-registry';
 import { EngagementFlowSubsystem } from './engagement-flow-subsystem';
 import { ChatCompletionsSubsystem } from './chat-completions-subsystem';
 import { BlurContext, type BlurContextSnapshot, type FromActivityOpts } from './blur-context';
+import { FsExecSubsystem, PermissionPolicy } from './fs-exec-subsystem';
 import { RunSubsystem } from './run-subsystem';
 import { SecretarySubsystem } from './secretary-subsystem';
 import { bridgeProviderImpl } from './providers/bridge-provider';
@@ -43,6 +44,7 @@ import { engagementFlowExposures } from './engagement-flow-exposures';
 import { runExposures } from './run-exposures';
 import { secretaryExposures } from './secretary-exposures';
 import { chatCompletionsExposures, contextExposures } from './chat-completions-exposures';
+import { fsExposures, execExposures } from './fs-exec-exposures';
 
 export { AgentsSubsystem } from './agents-subsystem';
 export { AgentRepliesSubsystem } from './replies-subsystem';
@@ -241,6 +243,16 @@ const pack: LibraryPack = {
     const providers = new ProviderRegistry();
     const engagementFlow = new EngagementFlowSubsystem(runtime);
     const chatCompletions = new ChatCompletionsSubsystem(runtime);
+
+    // Decision 35 — bounded fs + exec primitives. Workspace root from
+    // env (BLUR_FS_WORKSPACE_ROOT) or process.cwd() as fallback.
+    // Default policy is conservative; hosts can mutate runtime.fs.policy
+    // post-install to add allowed commands or paths.
+    const fsExecPolicy = new PermissionPolicy({
+      workspaceRoot: process.env.BLUR_FS_WORKSPACE_ROOT || process.cwd(),
+    });
+    const fsExec = new FsExecSubsystem({ policy: fsExecPolicy });
+
     const runners = new RunSubsystem();
     const secretary = new SecretarySubsystem();
     runners.attachRuntime(runtime);
@@ -387,12 +399,33 @@ const pack: LibraryPack = {
     // then .completions, landing on this instance.
     const chat = { completions: chatCompletions };
 
+    // `fs` namespace — Decision 35 fs primitives + policy snapshot.
+    // The class instance carries the methods directly; we wrap
+    // snapshotPolicy to return a plain object (the policy class
+    // itself doesn't round-trip through script isolates).
+    const fs = {
+      read: fsExec.read.bind(fsExec),
+      write: fsExec.write.bind(fsExec),
+      edit: fsExec.edit.bind(fsExec),
+      glob: fsExec.glob.bind(fsExec),
+      grep: fsExec.grep.bind(fsExec),
+      snapshotPolicy: () => fsExec.policy.toSnapshot(),
+    };
+
+    // `exec` namespace — single `run` method, allowlist-gated.
+    const exec = {
+      run: fsExec.exec.bind(fsExec),
+    };
+
     return {
       objects: {
         agents, replies, turns, scheduler, providers, engagementFlow, runners, secretary,
         // Decision 34 — chat-completions primitive + context factory.
         chat,
         context: contextFactory,
+        // Decision 35 — bounded fs + exec primitives.
+        fs,
+        exec,
       },
       exposures: [
         ...exposures,
@@ -402,6 +435,8 @@ const pack: LibraryPack = {
         ...secretaryExposures,
         ...chatCompletionsExposures,
         ...contextExposures,
+        ...fsExposures,
+        ...execExposures,
         // Per-provider exposures (Decision 29 escape-hatch pattern).
         // Mounted under runtime.agents.providers.<kind>.*. Today none
         // of the built-in providers ship custom exposures; this picks
