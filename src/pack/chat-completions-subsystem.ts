@@ -537,13 +537,28 @@ export class ChatCompletionsSubsystem {
       return scriptHost.run(tag.body);
     }
 
-    // Descriptive tag — look up resolver via the walker.
-    const resolvers = runtime.tagWalker?.resolvers?.();
-    if (resolvers && resolvers[tag.kind]) {
-      return resolvers[tag.kind](tag);
+    // Descriptive tag (Decision 37) — delegate to engagement-flow's
+    // resolveGenericTag which owns the dispatch by action attribute
+    // (read/list/count/update/invoke) + walker resolver-map lookup.
+    // Decision 34 keeps chat.completions independent of engagement
+    // SEMANTICS (no agent, no history, no audit) but leans on
+    // engagement-flow for the entity-tag execution machinery — the
+    // walker integration is single-source-of-truth there. A future
+    // refactor can extract that helper into a free function.
+    // Look up via runtime.extensions (the script-isolate-facing
+    // surface mounts objects there; direct `runtime.engagementFlow`
+    // isn't a property on the substrate-side reference).
+    const extensions = (this.runtime as unknown as {
+      extensions?: { get?: (name: string) => unknown };
+    }).extensions;
+    const engagementFlow = extensions?.get?.('engagementFlow') as
+      | { resolveGenericTag?: (tag: BTag) => Promise<{ ok?: boolean; value?: unknown; error?: string }> }
+      | undefined;
+    if (engagementFlow && typeof engagementFlow.resolveGenericTag === 'function') {
+      return engagementFlow.resolveGenericTag(tag);
     }
 
-    return { ok: false, error: `chat.completions: no resolver for tag kind '${tag.kind}'` };
+    return { ok: false, error: `chat.completions: no resolver for tag kind '${tag.kind}' (runtime.engagementFlow.resolveGenericTag unavailable)` };
   }
 
   // ---------------------------------------------------------------------

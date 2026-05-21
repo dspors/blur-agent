@@ -588,7 +588,21 @@ export class EngagementFlowSubsystem implements Persistable {
    * as `resolveBPTag` to sidestep the script-isolate this-binding edge
    * cases that bite `<b:script>` for primitives with backref state.
    */
-  private async resolveGenericTag(tag: import('./b-tags').BTag): Promise<{
+  /**
+   * Resolve a Decision-37 descriptive tag (e.g. `<b:library>`,
+   * `<b:project>`, `<b:ticket>`). Dispatches by `action` attribute
+   * (read/list/count/update/invoke) and consults
+   * `runtime.tagWalker.resolvers()` for the per-kind primitive map.
+   *
+   * Made public (Decision 34) so the ChatCompletionsSubsystem can
+   * reuse the same dispatch — chat.completions doesn't own its own
+   * walker integration; engagement-flow remains the single source of
+   * truth for entity-tag execution semantics. A future refactor can
+   * extract this into a free function that takes (runtime, tag) and
+   * doesn't depend on the subsystem class state at all; today the
+   * private helpers (runGenericRead/List/Count/etc.) bind to `this`.
+   */
+  async resolveGenericTag(tag: import('./b-tags').BTag): Promise<{
     ok: boolean;
     value?: unknown;
     error?: string;
