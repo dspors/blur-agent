@@ -81,6 +81,18 @@ export const contextExposures: MethodExposure[] = [
   },
   {
     objectPath: 'context',
+    method: 'compose',
+    primitivePath: 'context.compose',
+    signature: '(layers: { intro?: string; activity?: string; catalog?: string; role?: string; state?: string; [custom: string]: string | undefined }): BlurContextSnapshot',
+    description:
+      'Compose a BlurContext directly from explicit per-layer values. Canonical layers (intro / activity / catalog / role / state) emit in that order; extra keys append in insertion order. Empty / undefined entries are skipped. Used by the workbench context-builder UI to build a snapshot without needing a real Activity in the substrate.',
+    sideEffect: 'read',
+    example:
+      "const snap = runtime.context.compose({ intro: 'You are a helper.', role: 'run' });",
+    category: 'primary',
+  },
+  {
+    objectPath: 'context',
     method: 'describe',
     primitivePath: 'context.describe',
     signature: '(snapshot: BlurContextSnapshot): { totalBytes: number; layerCount: number; historyCount: number; layerSizes: Record<string, number>; layerHashes: Record<string, string>; hash: string }',
@@ -88,5 +100,52 @@ export const contextExposures: MethodExposure[] = [
       'Per-layer byte sizes + SHA-256 hashes + overall hash for a snapshot. Used by tuning UIs (show layer breakdown) and cache-discipline audits (verify byte-stability).',
     sideEffect: 'read',
     category: 'support',
+  },
+  // -----------------------------------------------------------------------
+  // Named snapshot storage. Persistable-backed; survives pack reload.
+  // -----------------------------------------------------------------------
+  {
+    objectPath: 'context.snapshots',
+    method: 'save',
+    primitivePath: 'context.snapshots.save',
+    signature: '(name: string, snapshot: BlurContextSnapshot): { name: string; hash: string; savedAt: string }',
+    description:
+      'Save a BlurContextSnapshot under a name. Overwrites if present. Names must be non-empty, <= 120 chars, no path separators. Returns the snapshot hash + savedAt timestamp.',
+    sideEffect: 'write',
+    example:
+      "const r = runtime.context.snapshots.save('eval-baseline-v1', snap);",
+    category: 'primary',
+  },
+  {
+    objectPath: 'context.snapshots',
+    method: 'load',
+    primitivePath: 'context.snapshots.load',
+    signature: '(name: string): BlurContextSnapshot | null',
+    description:
+      'Load a saved snapshot by name. Returns null if not present. Returned snapshot is a defensive copy — mutating it does not affect the store.',
+    sideEffect: 'read',
+    example:
+      "const snap = runtime.context.snapshots.load('eval-baseline-v1');",
+    category: 'primary',
+  },
+  {
+    objectPath: 'context.snapshots',
+    method: 'list',
+    primitivePath: 'context.snapshots.list',
+    signature: '(): Array<{ name: string; hash: string; layerCount: number; historyCount: number; totalBytes: number; savedAt: string }>',
+    description:
+      'List all saved snapshots — metadata only (no full bodies). Sorted by savedAt descending. Use load(name) to retrieve a body.',
+    sideEffect: 'read',
+    category: 'primary',
+  },
+  {
+    objectPath: 'context.snapshots',
+    method: 'delete',
+    primitivePath: 'context.snapshots.delete',
+    signature: '(name: string): { existed: boolean }',
+    description:
+      'Remove a saved snapshot. Returns whether one was present. No-op for unknown names.',
+    sideEffect: 'write',
+    category: 'primary',
   },
 ];

@@ -33,6 +33,7 @@ import { EngagementFlowSubsystem } from './engagement-flow-subsystem';
 import { ChatCompletionsSubsystem } from './chat-completions-subsystem';
 import { BlurContext, type BlurContextSnapshot, type FromActivityOpts } from './blur-context';
 import { FsExecSubsystem, PermissionPolicy } from './fs-exec-subsystem';
+import { ContextSnapshotsSubsystem } from './context-snapshots-subsystem';
 import { RunSubsystem } from './run-subsystem';
 import { SecretarySubsystem } from './secretary-subsystem';
 import { bridgeProviderImpl } from './providers/bridge-provider';
@@ -373,11 +374,23 @@ const pack: LibraryPack = {
       agents, replies, turns, scheduler, engagementFlow,
     });
 
+    // Snapshot storage — named save/load/list/delete for BlurContext
+    // snapshots. Implements Persistable so saves survive pack reload.
+    // Folded into the contextFactory below so the script-facing
+    // namespace is `runtime.context.snapshots.*`.
+    const contextSnapshots = new ContextSnapshotsSubsystem();
+
     // Context factory — exposes BlurContext static factories via the
     // script-facing surface as `runtime.context.fromActivity(...)`.
     // Returns plain-data snapshots because V8 isolates don't
     // round-trip class instances. The chat.completions subsystem
     // accepts either the live class instance OR a snapshot.
+    //
+    // The factory ALSO carries the snapshot subsystem under `.snapshots`
+    // and delegates Persistable methods to it — this lets Pack-Manager's
+    // auto-detection pick up the storage from the top-level `context`
+    // host entry without polluting the top level with a second host
+    // object.
     const contextFactory = {
       async fromActivity(opts: Omit<FromActivityOpts, 'runtime'>): Promise<BlurContextSnapshot> {
         const ctx = await BlurContext.fromActivity({ runtime, ...opts });
@@ -389,8 +402,28 @@ const pack: LibraryPack = {
       fromComposed(rawText: string): BlurContextSnapshot {
         return BlurContext.fromComposed(rawText).toSnapshot();
       },
+      compose(layers: Partial<Record<string, string>>): BlurContextSnapshot {
+        return BlurContext.fromLayers(layers).toSnapshot();
+      },
       describe(snapshot: BlurContextSnapshot) {
         return BlurContext.fromSnapshot(snapshot).describe();
+      },
+      // Named-snapshot storage.
+      snapshots: {
+        save: contextSnapshots.save.bind(contextSnapshots),
+        load: contextSnapshots.load.bind(contextSnapshots),
+        list: contextSnapshots.list.bind(contextSnapshots),
+        delete: contextSnapshots.delete.bind(contextSnapshots),
+      },
+      // Persistable surface — delegates to the snapshot subsystem.
+      saveJson(): string {
+        return contextSnapshots.saveJson();
+      },
+      loadJson(s: string): void {
+        contextSnapshots.loadJson(s);
+      },
+      consumeDirty(): boolean {
+        return contextSnapshots.consumeDirty();
       },
     };
 

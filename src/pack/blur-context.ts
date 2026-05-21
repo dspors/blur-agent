@@ -255,6 +255,35 @@ export class BlurContext {
   }
 
   /**
+   * Build a context from explicit per-layer values.
+   *
+   * Canonical layers (intro / activity / catalog / role / state) are
+   * placed in that order; any extra keys are appended in insertion
+   * order. Empty / undefined values are skipped.
+   *
+   * Used by the workbench context-builder UI — the user can type or
+   * paste per-layer content and get a usable BlurContext without
+   * needing a real Activity in the substrate.
+   */
+  static fromLayers(layers: Partial<Record<LayerName, string>>): BlurContext {
+    const out = new Map<LayerName, string>();
+    const CANONICAL: LayerName[] = ['intro', 'activity', 'catalog', 'role', 'state'];
+    for (const name of CANONICAL) {
+      const v = layers[name];
+      if (typeof v === 'string' && v.length > 0) {
+        out.set(name, v);
+      }
+    }
+    for (const [name, v] of Object.entries(layers)) {
+      if (CANONICAL.includes(name)) continue;
+      if (typeof v === 'string' && v.length > 0) {
+        out.set(name, v);
+      }
+    }
+    return new BlurContext(out, []);
+  }
+
+  /**
    * Single-layer context holding `rawText` as the 'custom-composed'
    * layer. For callers that already have a prefix string (e.g. a
    * back-compat shim wrapping the old dispatch path) and just want to
