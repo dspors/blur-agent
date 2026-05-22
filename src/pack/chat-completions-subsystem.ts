@@ -81,6 +81,32 @@ export interface ToolDef {
   parameters?: Record<string, unknown>;
 }
 
+/**
+ * Credential reference passed into a chain. The engine resolves these
+ * once at chain start; resolved values are substituted into tag bodies
+ * at execution time and scrubbed from audit payloads. Values never
+ * cross back to the caller — chat.completions is the only place they
+ * touch (post-resolution).
+ *
+ * source='config' refs are dereferenced via runtime.config.getRaw with
+ * an auto-generated reason; source='session' refs ship the value
+ * inline (caller already resolved it).
+ *
+ * The substitution syntax is ${alias} inside tag bodies (e.g. b:script
+ * source: `runtime.http.fetch('https://x', { auth: '${apiKey}' })`).
+ */
+export interface ChatCredentialRef {
+  source: 'config' | 'session';
+  /** Required when source='config'. */
+  namespace?: string;
+  /** ConfigManager key (when source='config') OR identifier (when source='session'). */
+  key: string;
+  /** What the LLM sees in tag bodies — substituted by the engine before execution. */
+  alias: string;
+  /** Inline value when source='session'. Ignored when source='config'. */
+  value?: string;
+}
+
 export interface CreateOpts {
   model: ModelSpec;
   context: BlurContext | BlurContextSnapshot;
@@ -92,6 +118,23 @@ export interface CreateOpts {
   prompt: string | ChatMessage[];
   /** Reserved — v1 ignores. */
   tools?: ToolDef[];
+  /**
+   * Per-chain b:tag allowlist. When set, any tag whose kind isn't in
+   * this list short-circuits with a structured "tag not allowed"
+   * result; the chain CONTINUES (does not abort). When empty or
+   * undefined, no restriction applies (back-compat default).
+   *
+   * Composed by the intelligence dispatcher from a service's bundle
+   * references + explicit tags + caller-supplied extraTools. Passed
+   * verbatim here so chat.completions stays bundle-agnostic.
+   */
+  allowedTags?: string[];
+  /**
+   * Credential refs the engine resolves at chain start. Aliases
+   * substituted into tag bodies before execution; resolved values
+   * scrubbed from emit() payloads.
+   */
+  credentials?: ChatCredentialRef[];
   options?: {
     /** Max iterations; defaults to 16. Cap-reached short-circuits. */
     cap?: number;
@@ -176,6 +219,82 @@ export class ChatCompletionsSubsystem {
     const perIterationTimeoutMs = opts.options?.timeoutMs ?? 60_000;
     const abortSignal = opts.options?.abortSignal;
     const startedAt = Date.now();
+
+    // -------------------------------------------------------------------
+    // Phase 3 — resolve credentials ONCE at chain start.
+    //
+    // alias -> value map drives substitution at tag execution time.
+    // Audit scrubbing reverses the map (value -> '<credential:alias>').
+    // Values never appear in emit() payloads, ChainResult, or anywhere
+    // else that crosses out of the engine.
+    //
+    // Failures are fatal: a service that declares it needs credential X
+    // shouldn't run with X missing. We throw early before any model
+    // dispatch happens.
+    // -------------------------------------------------------------------
+    const credentialMap = new Map<string, string>(); // alias -> resolved value
+    const scrubMap: Array<{ value: string; alias: string }> = []; // value -> alias (for audit scrub)
+    if (opts.credentials && opts.credentials.length > 0) {
+      for (const ref of opts.credentials) {
+        if (!ref || typeof ref.alias !== 'string' || !ref.alias) {
+          throw new Error(`chat.completions: credential ref missing required 'alias'`);
+        }
+        if (credentialMap.has(ref.alias)) {
+          throw new Error(`chat.completions: duplicate credential alias '${ref.alias}'`);
+        }
+        let value: string;
+        if (ref.source === 'session') {
+          if (typeof ref.value !== 'string') {
+            throw new Error(`chat.completions: credential alias '${ref.alias}' (source=session) requires inline 'value'`);
+          }
+          value = ref.value;
+        } else if (ref.source === 'config') {
+          if (typeof ref.namespace !== 'string' || !ref.namespace) {
+            throw new Error(`chat.completions: credential alias '${ref.alias}' (source=config) requires 'namespace'`);
+          }
+          if (typeof ref.key !== 'string' || !ref.key) {
+            throw new Error(`chat.completions: credential alias '${ref.alias}' (source=config) requires 'key'`);
+          }
+          const config = (this.runtime as unknown as {
+            config?: { getRaw?: (ns: string, key: string, o: { reason: string }) => Promise<unknown> };
+          }).config;
+          if (!config || typeof config.getRaw !== 'function') {
+            throw new Error(
+              `chat.completions: credential alias '${ref.alias}' requires runtime.config.getRaw — ConfigManager not wired`,
+            );
+          }
+          const raw = await config.getRaw(ref.namespace, ref.key, {
+            reason: `chat.completions chainId=${chainId} alias=${ref.alias}`,
+          });
+          if (raw === null || raw === undefined) {
+            throw new Error(
+              `chat.completions: credential '${ref.namespace}/${ref.key}' (alias '${ref.alias}') not found in ConfigManager`,
+            );
+          }
+          value = typeof raw === 'string' ? raw : JSON.stringify(raw);
+        } else {
+          throw new Error(`chat.completions: credential alias '${ref.alias}' has unknown source '${(ref as { source?: unknown }).source}'`);
+        }
+        credentialMap.set(ref.alias, value);
+        // Track for audit-scrub. Skip empty values (would scrub everything).
+        if (value.length > 0) {
+          scrubMap.push({ value, alias: ref.alias });
+        }
+      }
+      // Longer values must be scrubbed before shorter overlapping ones
+      // (e.g. if alias A's value contains alias B's). Sort by descending length.
+      scrubMap.sort((a, b) => b.value.length - a.value.length);
+      // Register scrub for this chain so emit() can scrub event payloads.
+      this.chainScrubs.set(chainId, scrubMap);
+    }
+
+    // Normalize allowedTags. Per CreateOpts contract: empty/undefined
+    // means "no restriction" (back-compat). Only a non-empty list
+    // engages enforcement.
+    const allowedTagSet =
+      Array.isArray(opts.allowedTags) && opts.allowedTags.length > 0
+        ? new Set(opts.allowedTags)
+        : null;
 
     // tkt_633d0117 follow-up — accept BOTH Blur canonical modelRefs
     // (e.g. "qwen-2-1-5b-instruct", the suffix of a Model Table row
@@ -332,8 +451,47 @@ export class ChatCompletionsSubsystem {
           let resultText: string;
           let status: 'ok' | 'error' = 'ok';
           let tagError: string | undefined;
+
+          // ---------------- Phase 3 — allowlist enforcement ----------------
+          // When allowedTags is set and tag.kind isn't in it, short-circuit
+          // with a structured error. Chain CONTINUES (does not abort) — the
+          // model sees the deny result and can adjust.
+          if (allowedTagSet && !allowedTagSet.has(tag.kind)) {
+            status = 'error';
+            tagError = `tag kind '${tag.kind}' not in this chain's allowlist`;
+            resultText = renderTagResult(tag, 'error', tagError);
+            const execMs = Date.now() - tagStartedAt;
+            tagResults.push({
+              position: tag.position,
+              kind: tag.kind,
+              status,
+              resultLen: resultText.length,
+              error: tagError,
+              execMs,
+            });
+            renderedBlocks.push(resultText);
+            this.emit('chat.completions.tag-denied', {
+              chainId, iter, position: tag.position, kind: tag.kind, reason: 'allowlist',
+            });
+            continue;
+          }
+
           try {
-            const r = await this.executeTag(tag);
+            // -------- Phase 3 — credential substitution --------
+            // Substitute ${alias} in tag body before dispatch. Tags are
+            // immutable by spec; we build a shallow-modified clone so
+            // executeTag sees the substituted body. The model never sees
+            // the substituted value — only the engine and the dispatched
+            // primitive do.
+            let execTag: BTag = tag;
+            if (credentialMap.size > 0 && typeof tag.body === 'string' && tag.body.includes('${')) {
+              const substituted = substituteCredentials(tag.body, credentialMap);
+              if (substituted !== tag.body) {
+                execTag = { ...tag, body: substituted };
+              }
+            }
+
+            const r = await this.executeTag(execTag);
             if (r.ok === false) {
               status = 'error';
               tagError = r.error ?? 'tag run failed';
@@ -347,6 +505,17 @@ export class ChatCompletionsSubsystem {
             tagError = (err as Error)?.message ?? String(err);
             resultText = renderTagResult(tag, 'error', tagError);
           }
+
+          // -------- Phase 3 — scrub credential values from result text --------
+          // The result text is concatenated into the tool message sent
+          // back to the model. If a credential value leaked through (e.g.
+          // an HTTP response echoes the credential), replace it with
+          // <credential:alias>.
+          if (scrubMap.length > 0) {
+            resultText = scrubText(resultText, scrubMap);
+            if (tagError) tagError = scrubText(tagError, scrubMap);
+          }
+
           const execMs = Date.now() - tagStartedAt;
           tagResults.push({
             position: tag.position,
@@ -392,6 +561,9 @@ export class ChatCompletionsSubsystem {
         totalDurationMs: Date.now() - startedAt,
         error,
       });
+      // Phase 3 — release the per-chain scrub map. Done AFTER the
+      // final emit so the completed event still scrubs.
+      this.chainScrubs.delete(chainId);
     }
 
     // finalReply = last assistant message content (or empty if no
@@ -659,7 +831,24 @@ export class ChatCompletionsSubsystem {
   // ---------------------------------------------------------------------
 
   private emit(kind: string, data: Record<string, unknown>): void {
-    const event = { kind, data: { ...data }, at: new Date().toISOString() };
+    // Phase 3 — defensive scrub on every emit. If this chain has
+    // credentials, the scrubMap (stored per-chain) replaces values
+    // with alias markers anywhere they appear in stringified payloads.
+    // The map is consulted via a thread-local-ish field set by
+    // create() at chain start; in JS there's no real TLS, so we use
+    // a per-emit lookup keyed on chainId in `data`. To keep emit()
+    // pure-additive, the scrub list lives on the instance under
+    // a private chainId → scrubMap map populated by create().
+    const chainId = (data as { chainId?: string }).chainId;
+    const scrub = chainId ? this.chainScrubs.get(chainId) : undefined;
+    // scrubDeep preserves shape — when fed Record<string,unknown>, returns
+    // Record<string,unknown>. Cast accordingly.
+    const scrubbed: Record<string, unknown> =
+      scrub && scrub.length > 0
+        ? (scrubDeep(data, scrub) as Record<string, unknown>)
+        : data;
+
+    const event = { kind, data: { ...scrubbed }, at: new Date().toISOString() };
     this.recentEvents.push(event);
     if (this.recentEvents.length > ChatCompletionsSubsystem.EVENTS_CAP) {
       this.recentEvents.shift();
@@ -667,15 +856,17 @@ export class ChatCompletionsSubsystem {
     // Best-effort audit emit — degrade gracefully if not available.
     try {
       const audit = (this.runtime as unknown as { audit?: { emit?: (kind: string, ref: string, data: Record<string, unknown>) => void } }).audit;
-      const chainId = (data as { chainId?: string }).chainId;
       const ref = chainId ? `item:chains[${chainId}]` : 'item:chat.completions';
       if (audit && typeof audit.emit === 'function') {
-        audit.emit(kind, ref, data);
+        audit.emit(kind, ref, scrubbed);
       }
     } catch {
       /* swallow */
     }
   }
+
+  /** Per-chain scrub maps. Populated in create() at chain start, cleared in `finally`. */
+  private chainScrubs: Map<string, Array<{ value: string; alias: string }>> = new Map();
 }
 
 // ============================================================================
@@ -726,4 +917,61 @@ function flattenMessages(messages: ChatMessage[]): string {
     }
   }
   return parts.join('\n──\n');
+}
+
+// ============================================================================
+// Phase 3 — credential substitution + audit-scrub helpers
+// ============================================================================
+
+/**
+ * Replace ${alias} occurrences in `text` with resolved credential
+ * values. Aliases must be ASCII word characters (\w). Unknown aliases
+ * are left intact so the calling primitive can surface its own
+ * "unknown placeholder" error rather than silently substituting empty.
+ */
+function substituteCredentials(text: string, creds: Map<string, string>): string {
+  if (!text || !text.includes('${')) return text;
+  return text.replace(/\$\{(\w+)\}/g, (whole, alias) => {
+    const v = creds.get(alias);
+    return v === undefined ? whole : v;
+  });
+}
+
+/**
+ * Scrub credential values from a plain string. Replaces each matched
+ * value with `<credential:alias>` so reviewers can tell which alias's
+ * value was scrubbed without seeing it. Caller is expected to pass the
+ * scrubMap sorted by descending value length (longest first) so
+ * overlapping values don't leave fragments.
+ */
+function scrubText(text: string, scrub: Array<{ value: string; alias: string }>): string {
+  if (!text || scrub.length === 0) return text;
+  let out = text;
+  for (const { value, alias } of scrub) {
+    if (!value || !out.includes(value)) continue;
+    // Plain split-join — avoids regex escaping for arbitrary values.
+    out = out.split(value).join(`<credential:${alias}>`);
+  }
+  return out;
+}
+
+/**
+ * Deep-scrub helper: walks an event-payload object, scrubbing strings
+ * and recursing into plain objects + arrays. Best-effort; non-string
+ * leaves pass through unchanged. Cycles are not expected in emit
+ * payloads (they're all simple data), but a depth cap protects us.
+ */
+function scrubDeep(obj: unknown, scrub: Array<{ value: string; alias: string }>, depth = 0): unknown {
+  if (depth > 8) return obj;
+  if (obj === null || obj === undefined) return obj;
+  if (typeof obj === 'string') return scrubText(obj, scrub);
+  if (Array.isArray(obj)) return obj.map((v) => scrubDeep(v, scrub, depth + 1));
+  if (typeof obj === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+      out[k] = scrubDeep(v, scrub, depth + 1);
+    }
+    return out;
+  }
+  return obj;
 }
