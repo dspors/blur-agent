@@ -2,15 +2,18 @@
 slug: agent-roles
 title: Agent Roles
 aliases: [roles, agent-types, role-catalog, sa-agent-roles, seeded-roles]
-keywords: [agent, role, conductor, secretary, scheduler, supervisor, configuration, run, oversight, coordinator, project-coordinator, runagent, scope, binding, register, catalog]
+keywords: [agent, role, conductor, secretary, scheduler, supervisor, configuration, run, oversight, coordinator, project-coordinator, instructor, advisor, assessor, runagent, scope, binding, register, catalog, non-claude-ai]
 summary: >
   Catalog of agent roles in blur-agent — supervisor, configuration,
-  conductor, run, oversight, secretary, scheduler, coordinator. Each
-  role declares its responsibilities, default binding scopes, and
-  handoff layout. Roles are an open registry; new ones register at
-  runtime. Coordinator (added 2026-05) carries cross-Track state
-  awareness as concurrent work grows; see role-project-coordinator
-  for the deep dive.
+  conductor, run, oversight, secretary, scheduler, coordinator,
+  instructor, advisor, assessor. Each role declares its
+  responsibilities, default binding scopes, and handoff layout.
+  Roles are an open registry; new ones register at runtime.
+  Coordinator (added 2026-05) carries cross-Track state awareness
+  as concurrent work grows; see role-project-coordinator for the
+  deep dive. Instructor (added 2026-05) is the first non-Claude AI
+  role — recommendation engine plugged into the OrientationDecl
+  `{ instruct }` form.
 type: architecture
 audience: [ai, human]
 status: settled
@@ -26,9 +29,18 @@ An **Agent** is a durable record of "who is doing what." It pairs a
 project / track / arc this agent is responsible for) and an optional
 **handoff** pointer (where the agent reads its charter).
 
-The role catalog is an **open registry**. blur-agent seeds eight
+The role catalog is an **open registry**. blur-agent seeds eleven
 default roles at install; packs and runtime callers can register
 additional roles via `runtime.agents.roles.register(...)`.
+
+**2026-05 expansion (Fork A / Fork B substrate work):** Instructor,
+Advisor, and Assessor join the eight original seeded roles.
+Instructor is the **first non-Claude AI role** — plugged into the
+polymorphic `OrientationDecl { instruct }` form so any primitive
+exposure can request a smart recommendation in place of a static
+docs/anchors/activities list. Advisor and Assessor are
+forthcoming patterns staking out the "answer a question" and
+"produce a structured judgment" niches respectively.
 
 ## v0.1 implementation status
 
@@ -39,18 +51,21 @@ substrate (per `brief-mvp-substrate-v1`):
 |---|---|---|---|
 | **Run** | **Implemented (Runner construct)** — `runtime.runners.*` | `run-subsystem.ts` | `role-run.md` |
 | **Secretary** | **Implemented (transcript sync)** — `runtime.secretary.*` | `secretary-subsystem.ts` | `role-secretary.md` |
+| **Instructor** | **Emerging (Fork B substrate)** — `runtime.instruct(...)` integration point in `OrientationDecl`; resolver stub at `orientation.ts` returns `{ docs: [], note: 'instruct unavailable — Phase 3 pending' }` until the Fork B primitive ships. First non-Claude AI role — cheap/fast provider by default. | `instruct-subsystem.ts` (Fork B) | (forthcoming) |
 | Conductor | Doc only — bootstrap via human/UI | — | (forthcoming) |
 | Project Coordinator | Doc only — see role-project-coordinator | — | `role-project-coordinator.md` |
 | Supervisor | Existing patterns (supervisor-patterns.md) | — | `supervisor-patterns.md` |
 | Configuration | Doc only | — | (forthcoming) |
 | Oversight | Doc only | — | (forthcoming) |
 | Scheduler | Doc only | — | (forthcoming) |
+| Advisor | Doc only (placeholder — pattern emerging) | — | (forthcoming) |
+| Assessor | Doc only (placeholder — pattern emerging) | — | (forthcoming) |
 
-The other six remain documentation-only until their patterns
+The other documentation-only roles wait on their patterns to
 crystallize. The bootstrap path: human/UI plays the role manually;
 as automation lands, the role's subsystem takes over.
 
-## The eight seeded roles
+## The eleven seeded roles
 
 | Role id | Label | Responsibility | Default binding scopes |
 |---|---|---|---|
@@ -62,6 +77,9 @@ as automation lands, the role's subsystem takes over.
 | `secretary` | Secretary Agent | Background extractor / organizer. Reads completed Engagements + Turn histories and writes structured outputs (project metadata, North Star transcripts, Decision logs). Mechanical sorting, not interpretation. Designed for cheap providers; many parallel passes run concurrently. | `project`, `cross-project` |
 | `scheduler` | Scheduler Agent | Resource optimizer for the WorkItem queue. Watches assignments, agent utilization, and recent outcomes; nudges assignment decisions on top of the deterministic algorithm. **Mechanism: picks who runs.** | `runtime`, `cross-project` |
 | `coordinator` | Project Coordinator | **Breadth-first across Tracks.** Rolls up cross-Track state on a cadence, detects cross-stream conflicts (shared assignee / quota) + dependency resolutions, feeds digests to Supervisor and UI, hints priorities to Scheduler. **Policy/signal layer for fleet awareness.** See [role-project-coordinator](role-project-coordinator) for the deep dive. | `cross-project`, `runtime` |
+| `instructor` | Instructor | **Recommendation engine.** Given a task + context, produces structured orientation (docs / anchors / activities / note) for the calling agent. Plugs into the polymorphic `OrientationDecl { instruct: { task, context? } }` form — any primitive exposure can declare instruct-based orientation, and the runtime calls the Instructor on each invocation, returning the resolved recommendation as the wrap orientation. **First non-Claude AI role** — designed for cheap, fast providers (Together by default). Read-mostly: synthesizes existing substrate state (docs, anchors, activities, recent decisions) into actionable guidance per call. Per-invocation latency budget matters. | `runtime`, `cross-project` |
+| `advisor` | Advisor | **Question-answerer.** Reads a situation (project state, recent decisions, open tickets, charter direction) and produces a structured recommendation on a specific question raised by the caller. Distinct from Configuration (which shapes the Charter) and Oversight (which raises Risks). The Advisor outputs an opinion + supporting evidence; the caller decides whether to act. Forthcoming — pattern emerging from the Fork A substrate-self-teaching work and is being placed-in-advance pending crystallization. | `project`, `cross-project` |
+| `assessor` | Assessor | **Judgment producer.** Reads work product (Turns, outputs, commits, briefs) and writes structured Assessments — quality / completeness / risk reads with explicit criteria. Distinct from Supervisor (which acts on assessments) and Secretary (which extracts without interpretation). Designed to run on a cadence per Track or per Phase, feeding the management UI. Forthcoming — staking out the "produce a defensible evaluation artifact" niche. | `track`, `project` |
 
 ## Binding scopes
 
