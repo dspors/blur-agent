@@ -265,8 +265,15 @@ export function d29ProviderAdapter(
 // ---------------------------------------------------------------------------
 
 export interface InstallD29AdaptersOpts {
-  /** Outer registry to register adapters into. */
-  outer: { register: (impl: ProviderImpl) => unknown };
+  /** Outer registry to register adapters into. `unregister` is optional
+   *  for backwards compat — when present (post-tkt_633d0117 blur-agent),
+   *  the installer drops the outer adapter on inner-provider unregister
+   *  so vendor-pack uninstall results in a clean "unknown kind" failure
+   *  instead of a stale-adapter "no inner provider" failure. */
+  outer: {
+    register: (impl: ProviderImpl) => unknown;
+    unregister?: (kind: string) => boolean;
+  };
   /** Provider kinds to bridge. Defaults to ['local', 'together']. */
   kinds?: string[];
 }
@@ -333,11 +340,29 @@ export function installD29Adapters(
     dispose = inner.onRegister((p, phase) => {
       if (!p || !targetSet.has(p.name)) return;
       if (phase === 'unregister') {
-        // We currently keep the outer adapter in place when the inner
-        // provider disappears — calls through the adapter will fail at
-        // the inner level, which is the correct degraded behavior.
-        // A follow-up can unregister the outer adapter if there's a
-        // clean uninstall path for it.
+        // tkt_633d0117 follow-up — when the inner provider goes away
+        // (vendor pack uninstall / hot-reload), drop the outer adapter
+        // too. Stale adapter would surface a confusing "no inner
+        // provider" downstream; clean unregister surfaces a truthful
+        // "unknown providerKind". Hot-reload then re-fires the
+        // register-phase below to re-wire the adapter against the
+        // freshly-loaded inner provider.
+        //
+        // Feature-detect outer.unregister: callers who pass an older
+        // outer (no unregister) get the prior leaky behavior, which is
+        // strictly no worse than before this fix.
+        if (typeof opts.outer.unregister === 'function') {
+          try {
+            opts.outer.unregister(p.name);
+          } catch (err) {
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[d29-adapter] outer.unregister('${p.name}') threw — adapter may persist:`,
+              err,
+            );
+          }
+        }
+        wired.delete(p.name);
         return;
       }
       if (wired.has(p.name)) return; // idempotent — already wired

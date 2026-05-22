@@ -229,6 +229,11 @@ interface InstalledSubsystems {
   turns: TurnsSubsystem;
   scheduler: SchedulerSubsystem;
   engagementFlow: EngagementFlowSubsystem;
+  /** tkt_633d0117 follow-up — disposer for the D29 adapter installer's
+   *  register/unregister subscription on the inner ProviderRegistry.
+   *  null when the inner registry doesn't expose `onRegister` (older
+   *  blur-providers-core build, or no inner registry mounted at all). */
+  d29AdapterDispose: (() => void) | null;
 }
 const installedByRuntime: WeakMap<BlurAIRuntime, InstalledSubsystems> = new WeakMap();
 
@@ -372,6 +377,7 @@ const pack: LibraryPack = {
     // find them and stop their audit subscribers on pack reload.
     installedByRuntime.set(runtime, {
       agents, replies, turns, scheduler, engagementFlow,
+      d29AdapterDispose: d29Result.dispose,
     });
 
     // Snapshot storage — named save/load/list/delete for BlurContext
@@ -525,6 +531,17 @@ const pack: LibraryPack = {
     try { subsystems.scheduler.stop(); } catch { /* swallow */ }
     try { subsystems.turns.stop(); } catch { /* swallow */ }
     try { subsystems.replies.stop(); } catch { /* swallow */ }
+    // tkt_633d0117 follow-up — release the D29 adapter installer's
+    // subscription on the inner ProviderRegistry. Without this, the
+    // closure (and the `providers` registry it references) would be
+    // retained by the inner registry's listener Set across pack
+    // reloads. The next install creates a fresh `providers` instance,
+    // so leaked closures from prior installs would fire register
+    // events into a dead outer registry — harmless today (registers
+    // into a ProviderRegistry no one queries) but a real memory leak.
+    if (typeof subsystems.d29AdapterDispose === 'function') {
+      try { subsystems.d29AdapterDispose(); } catch { /* swallow */ }
+    }
     // agents subsystem has no audit subscribers (no start/stop pair) —
     // its state is durable via Persistable and is repopulated on reload.
     installedByRuntime.delete(runtime);

@@ -156,6 +156,23 @@ export class ProviderRegistry {
     return this.toInfo(impl, now);
   }
 
+  /**
+   * Remove the provider implementation for `kind`. Returns true if it
+   * was registered (and is now removed), false otherwise. tkt_633d0117
+   * follow-up — added so the D29 adapter installer can drop the outer
+   * adapter when the inner vendor provider unregisters (vendor pack
+   * uninstall / hot-reload). Without this, the outer adapter would
+   * survive as a stale shell that fails downstream at the inner layer
+   * with a confusing "no inner provider" error; better to make the
+   * kind disappear from `Known` cleanly so the failure surface is
+   * "unknown providerKind", which is the truthful state.
+   */
+  unregister(kind: string): boolean {
+    const had = this.byKind.delete(kind);
+    this.registeredAtByKind.delete(kind);
+    return had;
+  }
+
   /** Get the impl for a kind, or null. */
   get(kind: string): ProviderImpl | null {
     return this.byKind.get(kind) ?? null;
