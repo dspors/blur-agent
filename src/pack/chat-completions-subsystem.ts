@@ -177,6 +177,37 @@ export class ChatCompletionsSubsystem {
     const abortSignal = opts.options?.abortSignal;
     const startedAt = Date.now();
 
+    // tkt_633d0117 follow-up — accept BOTH Blur canonical modelRefs
+    // (e.g. "qwen-2-1-5b-instruct", the suffix of a Model Table row
+    // keyed "together/qwen-2-1-5b-instruct") AND provider-native IDs
+    // (e.g. "arize-ai/qwen-2-1.5b-instruct"). If the requested
+    // modelId resolves to a Model Table row, swap in the row's
+    // providerModelId for dispatch; otherwise pass through unchanged.
+    //
+    // Why translate here, not in the provider: the Model Table is a
+    // substrate concept (Decision 36). Providers shouldn't know about
+    // it. Doing the swap once at the chat.completions boundary keeps
+    // every dispatch path (scheduler.requestTurn vs chat.completions
+    // vs direct agents.sendMessage) using the same resolved value the
+    // vendor SDK expects.
+    //
+    // The translation only fires when the candidate
+    // `${providerKind}/${modelId}` matches a modelRef in the table.
+    // Provider-native IDs that include vendor prefixes (e.g.
+    // "openai/gpt-oss-120b") build candidates like
+    // "together/openai/gpt-oss-120b" which never match a modelRef
+    // (modelRefs follow `<providerKind>/<single-segment>`), so they
+    // pass through untouched.
+    const requestedModelId = opts.model.modelId;
+    const resolvedModelId = this.resolveProviderModelId(
+      opts.model.providerKind,
+      requestedModelId,
+    );
+    const dispatchModel: ModelSpec = resolvedModelId === requestedModelId
+      ? opts.model
+      : { ...opts.model, modelId: resolvedModelId };
+
+
     // Reconstitute BlurContext from snapshot if needed (script-isolate
     // callers pass plain-data snapshots; in-substrate callers pass the
     // class instance directly).
@@ -200,7 +231,14 @@ export class ChatCompletionsSubsystem {
     this.emit('chat.completions.started', {
       chainId,
       providerKind: opts.model.providerKind,
-      modelId: opts.model.modelId,
+      // modelId is the value DISPATCHED to the provider — already
+      // Model-Table-resolved when caller passed a Blur modelRef.
+      // requestedModelId surfaces the caller's original input so
+      // diagnostics can see when a translation occurred.
+      modelId: dispatchModel.modelId,
+      ...(requestedModelId !== dispatchModel.modelId
+        ? { requestedModelId }
+        : {}),
       contextLayers: baseContext.layers.size,
       contextBytes: baseContext.describe().totalBytes,
       promptBytes: messages.reduce((a, m) => a + Buffer.byteLength(m.content, 'utf8'), 0),
@@ -234,7 +272,7 @@ export class ChatCompletionsSubsystem {
         let replyText: string;
         try {
           replyText = await this.invokeProvider({
-            model: opts.model,
+            model: dispatchModel,
             promptText: flattenedText,
             chainId,
             iter,
@@ -572,6 +610,48 @@ export class ChatCompletionsSubsystem {
     }
 
     return { ok: false, error: `chat.completions: no resolver for tag kind '${tag.kind}' (runtime.engagementFlow.resolveGenericTag unavailable)` };
+  }
+
+  // ---------------------------------------------------------------------
+  // Private — model resolution
+  // ---------------------------------------------------------------------
+
+  /**
+   * tkt_633d0117 follow-up. Consult the Model Table (Decision 36) for
+   * a row whose `modelRef` matches `${providerKind}/${modelId}`. When
+   * found, returns the row's `providerModelId` (what the vendor SDK
+   * expects); otherwise returns the input modelId unchanged.
+   *
+   * Failure modes (all return the input unchanged):
+   *   - runtime.tables not wired (older runtime, mock test fixture)
+   *   - tables.listModels throws
+   *   - no row matches the candidate modelRef
+   *
+   * This is the ONLY place chat.completions interprets the modelId —
+   * downstream uses the resolved value verbatim.
+   */
+  private resolveProviderModelId(providerKind: string, modelId: string): string {
+    if (!modelId || typeof modelId !== 'string') return modelId;
+    const candidateRef = `${providerKind}/${modelId}`;
+    type ModelRow = { modelRef: string; providerKind: string; providerModelId: string };
+    const tables = (this.runtime as unknown as {
+      tables?: { listModels?: () => ModelRow[] };
+    }).tables;
+    if (!tables || typeof tables.listModels !== 'function') return modelId;
+    let rows: ModelRow[];
+    try {
+      rows = tables.listModels() ?? [];
+    } catch {
+      return modelId;
+    }
+    for (const row of rows) {
+      if (row && row.modelRef === candidateRef) {
+        return typeof row.providerModelId === 'string' && row.providerModelId
+          ? row.providerModelId
+          : modelId;
+      }
+    }
+    return modelId;
   }
 
   // ---------------------------------------------------------------------
