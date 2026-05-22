@@ -37,7 +37,7 @@
  */
 
 import type { Agent, SendMessageOpts } from '../types';
-import type { AgentRepliesSink, ProviderImpl } from '../provider-registry';
+import type { AgentRepliesSink, ProviderFallback, ProviderImpl } from '../provider-registry';
 
 // ---------------------------------------------------------------------------
 // Inner-registry shape (from blur-providers-core; not imported as a type to
@@ -259,36 +259,62 @@ export function d29ProviderAdapter(
 }
 
 // ---------------------------------------------------------------------------
-// Install helper — registers adapters for known inner provider names that are
-// present at install time. Skips silently when the inner registry isn't loaded
-// (e.g. running blur-agent against the mock-only test fixture).
+// Install helper — installs a LAZY FALLBACK RESOLVER on the outer registry
+// so any inner-registry provider becomes reachable on demand, regardless of
+// pack load order. tkt_633d0117 follow-up.
+//
+// Why lazy resolution (and not pre-registration or event subscription):
+//   - Pre-registration at install time (the original approach) silently
+//     skipped any inner provider that registered AFTER blur-agent's install
+//     ran. Pack load order became load-bearing — and in practice, blur-agent
+//     loads before blur-providers-core under PackManager's current order,
+//     so `Known: mock, bridge` was the steady-state failure.
+//   - Subscribing to the inner registry's `onRegister` (the 1af481d /
+//     b9b7c70 iteration) closed the WITHIN-PRESENCE race (inner present,
+//     providers register later) — but didn't fix the outer race (inner
+//     extension not mounted yet at our install time). We still returned
+//     dispose=null and no listener attached.
+//   - This lazy-fallback design eliminates BOTH races: on every outer
+//     get(kind) miss, we re-look-up the inner registry via
+//     runtime.extensions.get('providerRegistry') and mint a d29-adapter
+//     wrapper on the fly. If the inner registry only mounts at provider
+//     dispatch time, that's fine — the first dispatch finds it.
+//
+// Result: no pre-registration, no event subscription, no replay loop.
+// One function, no state. The outer registry's list() reflects the inner
+// providers because the fallback enumerates them via inner.list().
 // ---------------------------------------------------------------------------
 
 export interface InstallD29AdaptersOpts {
-  /** Outer registry to register adapters into. `unregister` is optional
-   *  for backwards compat — when present (post-tkt_633d0117 blur-agent),
-   *  the installer drops the outer adapter on inner-provider unregister
-   *  so vendor-pack uninstall results in a clean "unknown kind" failure
-   *  instead of a stale-adapter "no inner provider" failure. */
+  /**
+   * Outer registry to install the fallback resolver on. The previous
+   * register / unregister members are no longer needed — the lazy
+   * resolver minted on every outer.get() miss makes pre-registration
+   * obsolete, and inner-side unregister is naturally observed by the
+   * next get() failing to resolve.
+   */
   outer: {
-    register: (impl: ProviderImpl) => unknown;
-    unregister?: (kind: string) => boolean;
+    setFallback: (fb: ProviderFallback | null) => () => void;
   };
-  /** Provider kinds to bridge. Defaults to ['local', 'together']. */
+  /**
+   * Provider kinds to bridge. Defaults to ['local', 'together']. Acts
+   * as an allowlist on resolve() — even if the inner registry has
+   * additional providers (e.g. an experimental 'openai-direct'), we
+   * only adapt the kinds blur-agent's AgentProvider['kind'] union
+   * accepts, to keep the outer registry type-safe.
+   */
   kinds?: string[];
 }
 
 export interface InstallD29AdaptersResult {
-  registered: string[];
-  skipped: Array<{ kind: string; reason: string }>;
   /**
-   * tkt_633d0117 — disposer for the register-event subscription that
-   * wires adapters incrementally when inner providers load AFTER this
-   * call. null when the inner registry doesn't expose `onRegister`
-   * (older blur-providers-core) — in that case behavior is the legacy
-   * one-shot scan and pack-load-order matters again.
+   * Always present — disposer that uninstalls the fallback resolver
+   * (idempotent and safe against later overwrites). Non-nullable now
+   * because the fallback install never fails; older callers checking
+   * `if (dispose !== null)` still work, they just always take the
+   * truthy branch.
    */
-  dispose: (() => void) | null;
+  dispose: () => void;
 }
 
 export function installD29Adapters(
@@ -296,123 +322,44 @@ export function installD29Adapters(
   opts: InstallD29AdaptersOpts,
 ): InstallD29AdaptersResult {
   const kinds = opts.kinds ?? ['local', 'together'];
-  const inner = getInnerRegistry(runtime);
-  const result: InstallD29AdaptersResult = { registered: [], skipped: [], dispose: null };
+  const allowed = new Set(kinds);
 
-  if (!inner) {
-    for (const k of kinds) result.skipped.push({ kind: k, reason: 'no inner providerRegistry extension' });
-    return result;
-  }
-
-  // Single shared install path: synchronous one-shot scan happens via
-  // the listener after we subscribe (we replay the current list through
-  // it ourselves below — see "Replay" comment). This keeps the wiring
-  // logic in exactly one place.
-  const targetSet = new Set(kinds);
-  const wired = new Set<string>();
-  const wireOne = (innerProvider: InnerProvider): boolean => {
-    try {
-      opts.outer.register(
-        d29ProviderAdapter(runtime, {
-          kind: innerProvider.name,
-          label: innerProvider.label,
-          description: innerProvider.description,
-        }),
-      );
-      wired.add(innerProvider.name);
-      return true;
-    } catch (err) {
-      result.skipped.push({
-        kind: innerProvider.name,
-        reason: `outer register failed: ${(err as Error)?.message ?? String(err)}`,
+  // Lazy resolver — re-inspects the inner registry every call. No
+  // captured registry reference: getInnerRegistry() re-resolves via
+  // runtime.extensions.get('providerRegistry') so a registry that
+  // mounts AFTER this installer ran is picked up automatically.
+  const fallback: ProviderFallback = {
+    resolve(kind: string): ProviderImpl | null {
+      if (!allowed.has(kind)) return null;
+      const inner = getInnerRegistry(runtime);
+      if (!inner) return null;
+      // Inner-side presence check. We only mint an adapter when the
+      // inner provider is actually there — minting a stub adapter that
+      // would fail at sendMessage would surface a confusing "no inner
+      // provider" instead of the truthful "no provider for kind".
+      const innerProvider =
+        typeof inner.get === 'function'
+          ? inner.get(kind)
+          : (typeof inner.has === 'function' && inner.has(kind) ? { name: kind } : null);
+      if (!innerProvider) return null;
+      return d29ProviderAdapter(runtime, {
+        kind,
+        label: innerProvider.label,
+        description: innerProvider.description,
       });
-      return false;
-    }
+    },
+    enumerate(): string[] {
+      const inner = getInnerRegistry(runtime);
+      if (!inner) return [];
+      const list = typeof inner.list === 'function' ? (inner.list() ?? []) : [];
+      const out: string[] = [];
+      for (const p of list) if (p && allowed.has(p.name)) out.push(p.name);
+      return out;
+    },
   };
 
-  // tkt_633d0117 — subscribe FIRST, then replay the current list through
-  // the same callback. Subscribing first closes the register-during-replay
-  // race window: a provider that registers between our list() and our
-  // listener attachment still gets picked up because the listener was
-  // attached before the register() call lands.
-  let dispose: (() => void) | null = null;
-  if (typeof inner.onRegister === 'function') {
-    dispose = inner.onRegister((p, phase) => {
-      if (!p || !targetSet.has(p.name)) return;
-      if (phase === 'unregister') {
-        // tkt_633d0117 follow-up — when the inner provider goes away
-        // (vendor pack uninstall / hot-reload), drop the outer adapter
-        // too. Stale adapter would surface a confusing "no inner
-        // provider" downstream; clean unregister surfaces a truthful
-        // "unknown providerKind". Hot-reload then re-fires the
-        // register-phase below to re-wire the adapter against the
-        // freshly-loaded inner provider.
-        //
-        // Feature-detect outer.unregister: callers who pass an older
-        // outer (no unregister) get the prior leaky behavior, which is
-        // strictly no worse than before this fix.
-        if (typeof opts.outer.unregister === 'function') {
-          try {
-            opts.outer.unregister(p.name);
-          } catch (err) {
-            // eslint-disable-next-line no-console
-            console.warn(
-              `[d29-adapter] outer.unregister('${p.name}') threw — adapter may persist:`,
-              err,
-            );
-          }
-        }
-        wired.delete(p.name);
-        return;
-      }
-      if (wired.has(p.name)) return; // idempotent — already wired
-      if (wireOne(p)) {
-        result.registered.push(p.name);
-      }
-    });
-    result.dispose = dispose;
-  }
-
-  // Replay the current list — covers blur-agent-loaded-AFTER-providers.
-  // If the inner registry doesn't expose `onRegister`, this is also the
-  // ONLY pass (legacy fallback).
-  const currentlyRegistered: InnerProvider[] = (() => {
-    if (typeof inner.list === 'function') {
-      try { return inner.list() ?? []; } catch { return []; }
-    }
-    // No list() — fall back to per-kind has/get probes (legacy shape).
-    const out: InnerProvider[] = [];
-    for (const k of kinds) {
-      const present = typeof inner.has === 'function' ? inner.has(k) : !!inner.get?.(k);
-      if (!present) continue;
-      const p = typeof inner.get === 'function' ? inner.get(k) : null;
-      if (p) out.push(p);
-    }
-    return out;
-  })();
-
-  for (const p of currentlyRegistered) {
-    if (!targetSet.has(p.name)) continue;
-    if (wired.has(p.name)) continue;
-    if (wireOne(p)) result.registered.push(p.name);
-  }
-
-  // For any target kind we still don't have, record why (matches the
-  // legacy `skipped` shape so logging in index.ts stays useful).
-  for (const k of kinds) {
-    if (wired.has(k)) continue;
-    // Already pushed if wireOne failed; only push the "not yet registered" reason once.
-    if (!result.skipped.some((s) => s.kind === k)) {
-      result.skipped.push({
-        kind: k,
-        reason: dispose
-          ? 'inner provider not registered yet — will wire on register event'
-          : 'inner provider not registered (no onRegister hook to listen for it)',
-      });
-    }
-  }
-
-  return result;
+  const dispose = opts.outer.setFallback(fallback);
+  return { dispose };
 }
 
 // ---------------------------------------------------------------------------

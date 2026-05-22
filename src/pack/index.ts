@@ -230,10 +230,10 @@ interface InstalledSubsystems {
   scheduler: SchedulerSubsystem;
   engagementFlow: EngagementFlowSubsystem;
   /** tkt_633d0117 follow-up — disposer for the D29 adapter installer's
-   *  register/unregister subscription on the inner ProviderRegistry.
-   *  null when the inner registry doesn't expose `onRegister` (older
-   *  blur-providers-core build, or no inner registry mounted at all). */
-  d29AdapterDispose: (() => void) | null;
+   *  fallback resolver on the outer ProviderRegistry. Always present
+   *  (the install never fails). Removes the resolver so pack reload
+   *  doesn't leak closures referencing the old `providers` instance. */
+  d29AdapterDispose: () => void;
 }
 const installedByRuntime: WeakMap<BlurAIRuntime, InstalledSubsystems> = new WeakMap();
 
@@ -311,27 +311,21 @@ const pack: LibraryPack = {
 
     // D29 adapters for blur-providers-core's inner providers
     // (`local`, `together`). Bridges their sync-return ProviderRequest
-    // shape onto the D29 streaming-chunk shape. Skipped silently when
-    // the inner providerRegistry extension isn't loaded — production
-    // gets local+together when the providers pack is installed; mock-
-    // only test fixtures aren't affected.
-    // See general-activity-multi-provider-v1 §9 +
-    // src/pack/providers/d29-provider-adapter.ts.
-    const d29Result = installD29Adapters(runtime, { outer: providers });
-    if (d29Result.registered.length > 0) {
-      // eslint-disable-next-line no-console
-      console.log(
-        `[blur-agent] D29 adapter wired for: ${d29Result.registered.join(', ')}`,
-      );
-    }
-    if (d29Result.skipped.length > 0) {
-      // eslint-disable-next-line no-console
-      console.log(
-        `[blur-agent] D29 adapter skipped: ${d29Result.skipped
-          .map(s => `${s.kind} (${s.reason})`)
-          .join(', ')}`,
-      );
-    }
+    // shape onto the D29 streaming-chunk shape.
+    //
+    // tkt_633d0117 follow-up — installs a LAZY FALLBACK resolver on
+    // the outer ProviderRegistry rather than pre-registering adapters.
+    // Pack load order is no longer load-bearing: on every outer
+    // get(kind) miss, the resolver re-inspects the inner registry
+    // and mints an adapter on the fly. Whether blur-providers-core
+    // loads before, after, or via hot-reload, the next dispatch
+    // succeeds. See d29-provider-adapter.ts header for the design
+    // history (pre-registration → onRegister subscription → this).
+    const d29Result = installD29Adapters(runtime, {
+      outer: { setFallback: providers.setFallback.bind(providers) },
+    });
+    // eslint-disable-next-line no-console
+    console.log('[blur-agent] D29 adapter fallback installed for: local, together');
 
     // Seed the role catalog. Idempotent — duplicate seeds are
     // swallowed (load-from-disk may have already populated them).
@@ -531,14 +525,12 @@ const pack: LibraryPack = {
     try { subsystems.scheduler.stop(); } catch { /* swallow */ }
     try { subsystems.turns.stop(); } catch { /* swallow */ }
     try { subsystems.replies.stop(); } catch { /* swallow */ }
-    // tkt_633d0117 follow-up — release the D29 adapter installer's
-    // subscription on the inner ProviderRegistry. Without this, the
-    // closure (and the `providers` registry it references) would be
-    // retained by the inner registry's listener Set across pack
-    // reloads. The next install creates a fresh `providers` instance,
-    // so leaked closures from prior installs would fire register
-    // events into a dead outer registry — harmless today (registers
-    // into a ProviderRegistry no one queries) but a real memory leak.
+    // tkt_633d0117 follow-up — clear the D29 fallback resolver on the
+    // outer ProviderRegistry. The resolver closes over `runtime` (for
+    // re-resolving the inner registry), so leaving it installed across
+    // pack reload would shadow the next install's fallback. The
+    // setFallback disposer is idempotent and is a no-op if a newer
+    // installer has already replaced our fallback.
     if (typeof subsystems.d29AdapterDispose === 'function') {
       try { subsystems.d29AdapterDispose(); } catch { /* swallow */ }
     }

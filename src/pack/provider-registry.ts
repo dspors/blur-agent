@@ -131,9 +131,48 @@ export interface ProviderInfo {
   registeredAt: string;
 }
 
+/**
+ * Lazy-resolution hook for provider kinds NOT explicitly registered on
+ * this registry. tkt_633d0117 follow-up — replaces the prior "install-
+ * time pre-registration of D29 adapters" pattern, which was load-order
+ * sensitive (blur-agent loaded before blur-providers-core meant the
+ * adapter installer saw an empty inner registry and silently skipped).
+ *
+ * Lazy resolution makes load order irrelevant: `get(kind)` consults the
+ * resolver on miss; the resolver re-inspects the inner registry on every
+ * call, so a provider that registers AFTER the outer fallback was set
+ * is picked up by the very next dispatch.
+ *
+ * Convention: one fallback at a time. Setting a new fallback replaces
+ * any prior one (the prior dispose is a no-op after replacement — by
+ * design, the latest installer wins).
+ */
+export interface ProviderFallback {
+  /**
+   * Look up an impl by kind. Returns null when the fallback source
+   * doesn't know about this kind. The returned impl is used for one
+   * dispatch — implementations may return a fresh wrapper each call
+   * (cheap closure) or cache internally if expensive to mint.
+   */
+  resolve: (kind: string) => ProviderImpl | null;
+  /**
+   * Enumerate the kinds the fallback CAN resolve right now. Used by
+   * `list()` / `info()` so the surface reflects every reachable
+   * provider, not just the explicitly-registered ones. Order is
+   * advisory; the registry de-duplicates against explicit kinds.
+   */
+  enumerate: () => string[];
+}
+
 export class ProviderRegistry {
   private byKind = new Map<string, ProviderImpl>();
   private registeredAtByKind = new Map<string, string>();
+  /**
+   * tkt_633d0117 follow-up — optional fallback resolver consulted on
+   * `get(kind)` miss. See ProviderFallback. Single-slot; setFallback
+   * replaces.
+   */
+  private fallback_: ProviderFallback | null = null;
 
   /**
    * Register (or replace) a provider implementation. Returns the
@@ -173,23 +212,100 @@ export class ProviderRegistry {
     return had;
   }
 
-  /** Get the impl for a kind, or null. */
+  /**
+   * Set (or replace) the fallback resolver. Returns a disposer that
+   * clears the fallback IFF the same instance is still installed when
+   * called — installing a newer fallback first makes the disposer a
+   * no-op, so callers can't accidentally tear down someone else's
+   * registration. tkt_633d0117 follow-up.
+   */
+  setFallback(fb: ProviderFallback | null): () => void {
+    this.fallback_ = fb;
+    const installed = fb;
+    return () => {
+      if (this.fallback_ === installed) this.fallback_ = null;
+    };
+  }
+
+  /**
+   * Get the impl for a kind. Checks explicit registrations first; then
+   * consults the fallback resolver if present. Returns null when no
+   * source knows the kind.
+   */
   get(kind: string): ProviderImpl | null {
-    return this.byKind.get(kind) ?? null;
+    const explicit = this.byKind.get(kind);
+    if (explicit) return explicit;
+    if (this.fallback_) {
+      try {
+        return this.fallback_.resolve(kind) ?? null;
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[ProviderRegistry] fallback resolver threw for kind '${kind}':`,
+          err,
+        );
+        return null;
+      }
+    }
+    return null;
   }
 
-  /** Public info view of one provider. */
+  /** Public info view of one provider. Explicit registrations first, then fallback. */
   info(kind: string): ProviderInfo | null {
-    const impl = this.byKind.get(kind);
-    if (!impl) return null;
-    return this.toInfo(impl, this.registeredAtByKind.get(kind) ?? new Date().toISOString());
+    const explicit = this.byKind.get(kind);
+    if (explicit) {
+      return this.toInfo(explicit, this.registeredAtByKind.get(kind) ?? new Date().toISOString());
+    }
+    if (this.fallback_) {
+      try {
+        const impl = this.fallback_.resolve(kind);
+        if (impl) return this.toInfo(impl, new Date().toISOString());
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(`[ProviderRegistry.info] fallback resolver threw for kind '${kind}':`, err);
+      }
+    }
+    return null;
   }
 
-  /** Listing — sanitized view of all registered providers. */
+  /**
+   * Listing — sanitized view of all reachable providers. Explicit
+   * registrations are listed in registration order; fallback-resolved
+   * kinds are appended (de-duplicated against explicit). tkt_633d0117
+   * follow-up — without this, `runtime.agents.providers.list()` would
+   * understate the surface ("only mock + bridge") even though dispatch
+   * works for fallback-resolved kinds, leaving operators confused
+   * about why their `local` / `together` provider is "missing" from
+   * the listing but functional in chat.completions.
+   */
   list(): ProviderInfo[] {
     const out: ProviderInfo[] = [];
     for (const [kind, impl] of this.byKind) {
       out.push(this.toInfo(impl, this.registeredAtByKind.get(kind) ?? new Date().toISOString()));
+    }
+    if (this.fallback_) {
+      let kinds: string[] = [];
+      try {
+        kinds = this.fallback_.enumerate() ?? [];
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[ProviderRegistry.list] fallback.enumerate threw:', err);
+      }
+      const seen = new Set(this.byKind.keys());
+      for (const kind of kinds) {
+        if (seen.has(kind)) continue;
+        let impl: ProviderImpl | null = null;
+        try {
+          impl = this.fallback_.resolve(kind);
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn(`[ProviderRegistry.list] fallback.resolve threw for '${kind}':`, err);
+        }
+        if (impl) {
+          out.push(this.toInfo(impl, new Date().toISOString()));
+          seen.add(kind);
+        }
+      }
     }
     return out;
   }
