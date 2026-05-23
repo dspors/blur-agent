@@ -513,7 +513,7 @@ export class ChatCompletionsSubsystem {
               }
             }
 
-            const r = await this.executeTag(execTag);
+            const r = await this.executeTag(execTag, chainId);
             if (r.ok === false) {
               status = 'error';
               tagError = r.error ?? 'tag run failed';
@@ -753,12 +753,16 @@ export class ChatCompletionsSubsystem {
    *
    * Returns `{ ok, value, error }`.
    */
-  private async executeTag(tag: BTag): Promise<{ ok?: boolean; value?: unknown; error?: string }> {
+  private async executeTag(
+    tag: BTag,
+    chainId: string,
+  ): Promise<{ ok?: boolean; value?: unknown; error?: string }> {
     const runtime = this.runtime as unknown as {
       script?: { run?: (src: string) => Promise<{ ok?: boolean; value?: unknown; error?: string }> };
       tagWalker?: {
         resolvers?: () => Record<string, (tag: BTag) => Promise<{ ok?: boolean; value?: unknown; error?: string }>>;
       };
+      extensions?: { get?: (name: string) => unknown };
     };
 
     if (tag.kind === 'b:script' || tag.kind === 'b:s') {
@@ -771,14 +775,33 @@ export class ChatCompletionsSubsystem {
 
     // Phase 4 — verb-style tags (HTTP, browser, ...). These describe
     // operations, not entities; the entity-resolver tagWalker model
-    // doesn't fit them. Dispatched in-pack via VERB_TAG_RESOLVERS so
-    // chat.completions stays the single source of truth for verb tag
-    // execution (no extension-roundtrip required). Credential
-    // substitution has already replaced ${alias} placeholders in
-    // tag.body / tag.attrs upstream — resolvers see real values.
+    // doesn't fit them. Resolution path:
+    //   1. Consult runtime.extensions.get('verbTagResolvers') — packs
+    //      can register real backends (e.g. blur-browser registers
+    //      b:browser-* resolvers that drive Stagehand/Playwright).
+    //      Extension wins over in-pack stub.
+    //   2. Fall back to the in-pack VERB_TAG_RESOLVERS table for kinds
+    //      with no extension (b:http-fetch real, b:browser-* stubs).
+    // Credential substitution has already replaced ${alias} placeholders
+    // in tag.body / tag.attrs upstream — resolvers see real values.
+    // chainId is injected into tag.attrs so resolvers can scope
+    // chain-bound resources (per Decision dec_75c1587c).
+    const extensions = runtime.extensions;
+    const extResolversHost = extensions?.get?.('verbTagResolvers') as
+      | {
+          get?: (k: string) => undefined | ((tag: BTag) => Promise<{ ok?: boolean; value?: unknown; error?: string }>);
+          list?: () => string[];
+        }
+      | undefined;
+    const extResolver = extResolversHost?.get?.(tag.kind);
+    if (extResolver) {
+      const withChain: BTag = { ...tag, attrs: { ...tag.attrs, chainId } };
+      return extResolver(withChain);
+    }
     if (isVerbTag(tag.kind)) {
       const resolver = VERB_TAG_RESOLVERS[tag.kind];
-      return resolver(tag);
+      const withChain: BTag = { ...tag, attrs: { ...tag.attrs, chainId } };
+      return resolver(withChain);
     }
 
     // Engagement-flow owns the b:p (legacy property-read) and
@@ -788,9 +811,8 @@ export class ChatCompletionsSubsystem {
     // no history, no audit), only borrows the tag-execution machinery.
     // Look up via runtime.extensions (the substrate-side reference
     // doesn't have `runtime.engagementFlow` as a direct property).
-    const extensions = (this.runtime as unknown as {
-      extensions?: { get?: (name: string) => unknown };
-    }).extensions;
+    // (Reusing the `extensions` binding declared at the verb-tag dispatch
+    // block above.)
     const engagementFlow = extensions?.get?.('engagementFlow') as
       | {
           resolveGenericTag?: (tag: BTag) => Promise<{ ok?: boolean; value?: unknown; error?: string }>;
