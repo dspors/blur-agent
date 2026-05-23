@@ -83,6 +83,21 @@ export interface ChatMessage {
 }
 
 /**
+ * Per-layer placement hint. Reserved (Anchor 4 —
+ * context-placement-single-tier). Today every layer is sent on
+ * every call; placement is metadata that round-trips through
+ * snapshots but doesn't change render behavior.
+ *
+ * When Responses-API providers land:
+ *   - 'session' → upload once, reference by session id on
+ *     subsequent calls (server-resident)
+ *   - 'perCall' → re-send on every call (today's behavior)
+ *
+ * Absent placement is treated as 'perCall'.
+ */
+export type LayerPlacement = 'session' | 'perCall';
+
+/**
  * Serializable snapshot of a BlurContext. Returned across the
  * script-engine boundary because class instances don't round-trip
  * cleanly through V8 isolate sandboxing.
@@ -90,12 +105,22 @@ export interface ChatMessage {
  * `chat.completions.create` accepts either a live BlurContext instance
  * (in-substrate callers) OR a snapshot (script callers) — the
  * subsystem reconstitutes from snapshot when needed.
+ *
+ * `placements` is an optional side-map keyed by layer name. v1
+ * preserves it through round-trips but does not act on it. See
+ * Anchor 4 and ticket tkt_8ab71b9e for the planned use.
  */
 export interface BlurContextSnapshot {
   /** Ordered layer entries — insertion order is render order. */
   layers: Array<[LayerName, string]>;
   /** Conversation history. */
   history: ChatMessage[];
+  /**
+   * Reserved — per-layer placement hint for stateful-session
+   * providers. Today: round-tripped only, not consulted by render
+   * or dispatch. Absent entries default to 'perCall'.
+   */
+  placements?: Record<LayerName, LayerPlacement>;
   /** Marker for `isBlurContextSnapshot` detection. */
   readonly __blurContext: 'v1';
 }
@@ -168,14 +193,22 @@ export interface FromActivityOpts {
 export class BlurContext {
   private readonly _layers: ReadonlyMap<LayerName, string>;
   private readonly _history: ReadonlyArray<ChatMessage>;
+  /**
+   * Per-layer placement hint. Reserved (Anchor 4). Today v1 round-trips
+   * but doesn't consult; future Responses-API dispatch will read this
+   * to decide which layers are session-resident vs per-call.
+   */
+  private readonly _placements: ReadonlyMap<LayerName, LayerPlacement>;
 
   // Private — use static factories.
   private constructor(
     layers: ReadonlyMap<LayerName, string>,
     history: ReadonlyArray<ChatMessage>,
+    placements: ReadonlyMap<LayerName, LayerPlacement> = new Map(),
   ) {
     this._layers = layers;
     this._history = history;
+    this._placements = placements;
   }
 
   // ---------------------------------------------------------------------
@@ -306,7 +339,13 @@ export class BlurContext {
   static fromSnapshot(snap: BlurContextSnapshot): BlurContext {
     const layers = new Map<LayerName, string>(snap.layers);
     const history = Array.isArray(snap.history) ? snap.history.slice() : [];
-    return new BlurContext(layers, history);
+    const placements = new Map<LayerName, LayerPlacement>();
+    if (snap.placements && typeof snap.placements === 'object') {
+      for (const [name, p] of Object.entries(snap.placements)) {
+        if (p === 'session' || p === 'perCall') placements.set(name, p);
+      }
+    }
+    return new BlurContext(layers, history, placements);
   }
 
   /** Type-guard for snapshot vs live-instance discrimination. */
@@ -330,6 +369,15 @@ export class BlurContext {
     return this._history;
   }
 
+  /**
+   * Per-layer placement hint map. Reserved (Anchor 4). Absent entries
+   * default to 'perCall' at dispatch time. Today no dispatch path
+   * consults this — round-trip only.
+   */
+  get placements(): ReadonlyMap<LayerName, LayerPlacement> {
+    return this._placements;
+  }
+
   // ---------------------------------------------------------------------
   // Mutators (return new instances)
   // ---------------------------------------------------------------------
@@ -347,15 +395,41 @@ export class BlurContext {
     } else {
       next.delete(name);
     }
-    return new BlurContext(next, this._history);
+    return new BlurContext(next, this._history, this._placements);
   }
 
-  /** Remove a layer. No-op if not present. Returns a new instance. */
+  /** Remove a layer. No-op if not present. Returns a new instance.
+   * Also drops any placement hint for that layer. */
   withoutLayer(name: LayerName): BlurContext {
     if (!this._layers.has(name)) return this;
     const next = new Map(this._layers);
     next.delete(name);
-    return new BlurContext(next, this._history);
+    let placements = this._placements;
+    if (placements.has(name)) {
+      const nextP = new Map(placements);
+      nextP.delete(name);
+      placements = nextP;
+    }
+    return new BlurContext(next, this._history, placements);
+  }
+
+  /**
+   * Set or clear the placement hint for a layer. Reserved (Anchor 4) —
+   * v1 round-trips but doesn't act on it. Returns a new instance.
+   *
+   * Passing `null` clears any existing hint (layer falls back to
+   * 'perCall' default at dispatch time).
+   */
+  withPlacement(name: LayerName, placement: LayerPlacement | null): BlurContext {
+    const next = new Map(this._placements);
+    if (placement === null) {
+      if (!next.has(name)) return this;
+      next.delete(name);
+    } else {
+      if (this._placements.get(name) === placement) return this;
+      next.set(name, placement);
+    }
+    return new BlurContext(this._layers, this._history, next);
   }
 
   /**
@@ -370,13 +444,13 @@ export class BlurContext {
   withHistoryAppended(...messages: ChatMessage[]): BlurContext {
     if (messages.length === 0) return this;
     const next = this._history.concat(messages);
-    return new BlurContext(this._layers, next);
+    return new BlurContext(this._layers, next, this._placements);
   }
 
   /** Clear conversation history. Returns a new instance. */
   withoutHistory(): BlurContext {
     if (this._history.length === 0) return this;
-    return new BlurContext(this._layers, []);
+    return new BlurContext(this._layers, [], this._placements);
   }
 
   // ---------------------------------------------------------------------
@@ -465,11 +539,20 @@ export class BlurContext {
    * directly).
    */
   toSnapshot(): BlurContextSnapshot {
-    return {
+    const snap: BlurContextSnapshot = {
       layers: Array.from(this._layers.entries()),
       history: this._history.slice(),
       __blurContext: 'v1',
     };
+    // Only emit placements when at least one is set, to keep the wire
+    // shape unchanged for callers that don't use the (reserved)
+    // session-placement feature.
+    if (this._placements.size > 0) {
+      const out: Record<LayerName, LayerPlacement> = {};
+      for (const [name, p] of this._placements) out[name] = p;
+      snap.placements = out;
+    }
+    return snap;
   }
 }
 

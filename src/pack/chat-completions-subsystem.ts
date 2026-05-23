@@ -108,6 +108,28 @@ export interface ChatCredentialRef {
   value?: string;
 }
 
+/**
+ * Reserved shape for stateful-session providers. v1 ignores; the
+ * future Microsoft Responses-API integration will read it.
+ *
+ * - kind: a discriminator. Today only 'openai-responses' is anticipated,
+ *   but other stateful APIs (Anthropic Sessions, etc.) can register
+ *   their own kind without an interface break.
+ * - id: an existing session/response handle to thread; omit to mint
+ *   a new session (in combination with createIfMissing).
+ * - createIfMissing: when true, the provider mints a session if none
+ *   exists; the new id is returned in ChainResult.sessionId for the
+ *   caller to thread into subsequent invocations.
+ *
+ * See Anchor 4 (anchor-004-context-placement-single-tier) and ticket
+ * tkt_8ab71b9e for the planned implementation.
+ */
+export interface ChatSessionRef {
+  kind: 'openai-responses' | string;
+  id?: string;
+  createIfMissing?: boolean;
+}
+
 export interface CreateOpts {
   model: ModelSpec;
   context: BlurContext | BlurContextSnapshot;
@@ -136,6 +158,23 @@ export interface CreateOpts {
    * scrubbed from emit() payloads.
    */
   credentials?: ChatCredentialRef[];
+  /**
+   * Reserved (Anchor 4 — context-placement-single-tier). Optional
+   * handle for stateful-session providers (e.g. OpenAI Responses
+   * API via the future Microsoft pack). Today: silently ignored.
+   *
+   * When implemented:
+   *   - kind 'openai-responses' → dispatch via the Responses endpoint;
+   *     session.id threads conversation state across calls.
+   *   - createIfMissing:true mints a new session on first call and
+   *     returns its id in the ChainResult for the caller to thread
+   *     into subsequent invocations.
+   *
+   * Layers tagged `placement: 'session'` on the BlurContextSnapshot
+   * (via the `placements` side-map) will be uploaded once and NOT
+   * resent per call. See ticket tkt_8ab71b9e.
+   */
+  session?: ChatSessionRef;
   options?: {
     /** Max iterations; defaults to 16. Cap-reached short-circuits. */
     cap?: number;
