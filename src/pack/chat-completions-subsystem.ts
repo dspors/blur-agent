@@ -52,6 +52,7 @@ import {
   stringifyScriptReturn,
   type BTag,
 } from './b-tags';
+import { VERB_TAG_RESOLVERS, isVerbTag } from './verb-tag-resolvers';
 import {
   BlurContext,
   type BlurContextSnapshot,
@@ -478,16 +479,37 @@ export class ChatCompletionsSubsystem {
 
           try {
             // -------- Phase 3 — credential substitution --------
-            // Substitute ${alias} in tag body before dispatch. Tags are
-            // immutable by spec; we build a shallow-modified clone so
-            // executeTag sees the substituted body. The model never sees
-            // the substituted value — only the engine and the dispatched
-            // primitive do.
+            // Substitute ${alias} in tag body AND tag.attrs before
+            // dispatch. Tags are immutable by spec; we build a shallow-
+            // modified clone so executeTag sees substituted values. The
+            // model never sees the substituted value — only the engine
+            // and the dispatched primitive do.
+            //
+            // Phase 4 extension: verb tags (b:http-fetch, b:browser-*)
+            // carry credentials in attrs (e.g. headers='{"Authorization":
+            // "Bearer ${apiKey}"}'), not just body. Walk both.
             let execTag: BTag = tag;
-            if (credentialMap.size > 0 && typeof tag.body === 'string' && tag.body.includes('${')) {
-              const substituted = substituteCredentials(tag.body, credentialMap);
-              if (substituted !== tag.body) {
-                execTag = { ...tag, body: substituted };
+            if (credentialMap.size > 0) {
+              let nextBody = tag.body;
+              if (typeof tag.body === 'string' && tag.body.includes('${')) {
+                nextBody = substituteCredentials(tag.body, credentialMap);
+              }
+              let nextAttrs = tag.attrs;
+              let attrsChanged = false;
+              for (const [k, v] of Object.entries(tag.attrs)) {
+                if (typeof v === 'string' && v.includes('${')) {
+                  const sub = substituteCredentials(v, credentialMap);
+                  if (sub !== v) {
+                    if (!attrsChanged) {
+                      nextAttrs = { ...tag.attrs };
+                      attrsChanged = true;
+                    }
+                    nextAttrs[k] = sub;
+                  }
+                }
+              }
+              if (nextBody !== tag.body || attrsChanged) {
+                execTag = { ...tag, body: nextBody, attrs: nextAttrs };
               }
             }
 
@@ -724,10 +746,10 @@ export class ChatCompletionsSubsystem {
 
   /**
    * Run a single tag. Dispatches by kind:
-   *   - b:script / b:s — runtime.script.run (escape hatch)
-   *   - b:p            — legacy property read (unsupported here in v1;
-   *                      caller can use b:script as workaround)
-   *   - b:<word>       — walker resolver (Decision 37)
+   *   - b:script / b:s            — runtime.script.run (escape hatch)
+   *   - b:p                       — legacy property read (engagement-flow)
+   *   - b:http-fetch / b:browser-* — verb tags (in-pack table, Phase 4)
+   *   - b:<entity-word>           — engagement-flow walker resolver (Decision 37)
    *
    * Returns `{ ok, value, error }`.
    */
@@ -745,6 +767,18 @@ export class ChatCompletionsSubsystem {
         return { ok: false, error: 'runtime.script.run unavailable on host' };
       }
       return scriptHost.run(tag.body);
+    }
+
+    // Phase 4 — verb-style tags (HTTP, browser, ...). These describe
+    // operations, not entities; the entity-resolver tagWalker model
+    // doesn't fit them. Dispatched in-pack via VERB_TAG_RESOLVERS so
+    // chat.completions stays the single source of truth for verb tag
+    // execution (no extension-roundtrip required). Credential
+    // substitution has already replaced ${alias} placeholders in
+    // tag.body / tag.attrs upstream — resolvers see real values.
+    if (isVerbTag(tag.kind)) {
+      const resolver = VERB_TAG_RESOLVERS[tag.kind];
+      return resolver(tag);
     }
 
     // Engagement-flow owns the b:p (legacy property-read) and
