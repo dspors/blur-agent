@@ -297,11 +297,13 @@ export interface InstallD29AdaptersOpts {
     setFallback: (fb: ProviderFallback | null) => () => void;
   };
   /**
-   * Provider kinds to bridge. Defaults to ['local', 'together']. Acts
-   * as an allowlist on resolve() — even if the inner registry has
+   * Provider kinds to bridge. Defaults to ['local', 'together', 'anthropic'].
+   * Acts as an allowlist on resolve() — even if the inner registry has
    * additional providers (e.g. an experimental 'openai-direct'), we
    * only adapt the kinds blur-agent's AgentProvider['kind'] union
-   * accepts, to keep the outer registry type-safe.
+   * accepts, to keep the outer registry type-safe. When adding a new
+   * blur-providers-core ProviderImpl, also add its kind here AND add
+   * a matching interface to the AgentProvider union in types.ts.
    */
   kinds?: string[];
 }
@@ -321,7 +323,7 @@ export function installD29Adapters(
   runtime: RuntimeShape,
   opts: InstallD29AdaptersOpts,
 ): InstallD29AdaptersResult {
-  const kinds = opts.kinds ?? ['local', 'together'];
+  const kinds = opts.kinds ?? ['local', 'together', 'anthropic'];
   const allowed = new Set(kinds);
 
   // Lazy resolver — re-inspects the inner registry every call. No

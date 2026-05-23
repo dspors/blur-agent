@@ -165,7 +165,8 @@ export type AgentProvider =
   | TogetherProvider
   | OpenAIProvider
   | LocalProvider
-  | MockProvider;
+  | MockProvider
+  | AnthropicProvider;
 
 /**
  * Bridge-backed provider — a Claude session reached via the bridge
@@ -231,6 +232,23 @@ export interface LocalProvider {
 export interface MockProvider {
   kind: 'mock';
   script?: string;
+}
+
+/**
+ * Anthropic direct-API provider — Claude reached via api.anthropic.com/
+ * v1/messages (not via cowork bridge). Lifts the Claude API path out of
+ * the bridge proxy into a first-class provider alongside together/local.
+ * Use the bridge provider when you need stateful Claude sessions with
+ * IDE/desktop coordination; use anthropic for one-shot prompt/response
+ * pairs against the public API (vision, enrichment, classification).
+ */
+export interface AnthropicProvider {
+  kind: 'anthropic';
+  /** Anthropic model string, e.g. 'claude-sonnet-4-6'. */
+  model: string;
+  /** Secret-store reference, e.g. 'workspace:providers.anthropic.apiKey'. */
+  apiKeyRef: string;
+  sampling?: SamplingParams;
 }
 
 /**
