@@ -794,9 +794,16 @@ export class ChatCompletionsSubsystem {
    * found, returns the row's `providerModelId` (what the vendor SDK
    * expects); otherwise returns the input modelId unchanged.
    *
+   * Namespace note: the pack-side runtime exposes the ConfigTablesSubsystem
+   * as `runtime.tables` with SYNCHRONOUS methods (`getModel`, `listModels`,
+   * `findModels`). The script-side surface re-exposes it as `runtime.models`
+   * with ASYNC wrappers. Inside this pack we must use the pack-side name.
+   * Initial 9558ab4 used the right namespace but iterated listModels()
+   * instead of using getModel() for O(1) lookup.
+   *
    * Failure modes (all return the input unchanged):
    *   - runtime.tables not wired (older runtime, mock test fixture)
-   *   - tables.listModels throws
+   *   - tables.getModel throws
    *   - no row matches the candidate modelRef
    *
    * This is the ONLY place chat.completions interprets the modelId —
@@ -807,23 +814,18 @@ export class ChatCompletionsSubsystem {
     const candidateRef = `${providerKind}/${modelId}`;
     type ModelRow = { modelRef: string; providerKind: string; providerModelId: string };
     const tables = (this.runtime as unknown as {
-      tables?: { listModels?: () => ModelRow[] };
+      tables?: { getModel?: (modelRef: string) => ModelRow | null };
     }).tables;
-    if (!tables || typeof tables.listModels !== 'function') return modelId;
-    let rows: ModelRow[];
+    if (!tables || typeof tables.getModel !== 'function') return modelId;
+    let row: ModelRow | null;
     try {
-      rows = tables.listModels() ?? [];
+      row = tables.getModel(candidateRef);
     } catch {
       return modelId;
     }
-    for (const row of rows) {
-      if (row && row.modelRef === candidateRef) {
-        return typeof row.providerModelId === 'string' && row.providerModelId
-          ? row.providerModelId
-          : modelId;
-      }
-    }
-    return modelId;
+    return row && typeof row.providerModelId === 'string' && row.providerModelId
+      ? row.providerModelId
+      : modelId;
   }
 
   // ---------------------------------------------------------------------
