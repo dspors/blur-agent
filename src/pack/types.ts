@@ -166,7 +166,8 @@ export type AgentProvider =
   | OpenAIProvider
   | LocalProvider
   | MockProvider
-  | AnthropicProvider;
+  | AnthropicProvider
+  | AzureFoundryProvider;
 
 /**
  * Bridge-backed provider — a Claude session reached via the bridge
@@ -247,6 +248,33 @@ export interface AnthropicProvider {
   /** Anthropic model string, e.g. 'claude-sonnet-4-6'. */
   model: string;
   /** Secret-store reference, e.g. 'workspace:providers.anthropic.apiKey'. */
+  apiKeyRef: string;
+  sampling?: SamplingParams;
+}
+
+/**
+ * Azure AI Foundry-backed provider — direct call to an Azure-hosted
+ * model deployment via the OpenAI-compat /v1/chat/completions surface.
+ * Multi-endpoint: the `model` field is the Blur-side id that keys the
+ * endpoints map in workspace.config.json (e.g. 'fara-7b'). The provider
+ * pack resolves model → endpoint config (baseUrl + apiKey + path/
+ * modelName overrides) at dispatch time.
+ *
+ * v0 target lineup: Microsoft's Fara-7B (computer-use agent model,
+ * Qwen2.5-VL-7B base). Future entries are anything Foundry can host
+ * via serverless or managed compute that exposes OpenAI-compat chat
+ * completions — Phi-4, Mistral, Llama 3, Foundry-hosted open-weights
+ * models in general.
+ */
+export interface AzureFoundryProvider {
+  kind: 'azure-foundry';
+  /** Blur-side model id keying providers.azureFoundry.endpoints in workspace.config.json. */
+  model: string;
+  /**
+   * Secret-store reference, e.g.
+   * 'workspace:providers.azureFoundry.endpoints.fara-7b.apiKey'. Multi-
+   * endpoint means the apiKey is per-deployment, not per-provider.
+   */
   apiKeyRef: string;
   sampling?: SamplingParams;
 }
