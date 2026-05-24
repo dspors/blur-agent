@@ -208,13 +208,31 @@ export function d29ProviderAdapter(
         ...(params !== undefined ? { params } : {}),
       };
 
+      // tkt_fbd9c979 — caller-side layer-1 fallback ladder. Built from
+      // SendMessageOpts.fallbackList / .disableCuratedFallback; passed
+      // to inner.send() which threads it into the registry walker.
+      // Empty array on fallbackList is preserved (semantic: explicit
+      // no-fallback); only `undefined` is dropped.
+      const innerOpts: { fallbackList?: unknown[]; disableCuratedFallback?: boolean } = {};
+      if (sendOpts.fallbackList !== undefined) {
+        innerOpts.fallbackList = sendOpts.fallbackList;
+      }
+      if (sendOpts.disableCuratedFallback !== undefined) {
+        innerOpts.disableCuratedFallback = sendOpts.disableCuratedFallback;
+      }
+      const hasInnerOpts =
+        innerOpts.fallbackList !== undefined ||
+        innerOpts.disableCuratedFallback !== undefined;
+
       // Dispatch async; failures land on the reply, not the synchronous
       // return path.
       Promise.resolve()
         .then(async () => {
           let res: InnerProviderResponse;
           if (typeof inner.send === 'function') {
-            res = await inner.send(opts.kind, req);
+            res = hasInnerOpts
+              ? await inner.send(opts.kind, req, innerOpts as unknown)
+              : await inner.send(opts.kind, req);
           } else if (typeof inner.get === 'function') {
             const ip = inner.get(opts.kind);
             if (!ip || typeof ip.sendMessage !== 'function') {
@@ -222,6 +240,11 @@ export function d29ProviderAdapter(
                 `d29ProviderAdapter[${opts.kind}]: inner provider has no sendMessage`,
               );
             }
+            // Note: when we fall back to the per-provider .sendMessage path
+            // (no .send on the inner registry), the registry's fallback
+            // walker is bypassed entirely — so caller-side fallbackList
+            // has no consumer. Mirrors the existing behavior; should be
+            // unreachable in normal operation (core's registry exposes .send).
             res = await ip.sendMessage(req);
           } else {
             throw new Error(

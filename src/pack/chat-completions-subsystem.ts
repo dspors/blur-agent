@@ -73,6 +73,26 @@ export interface ModelSpec {
   modelId: string;
   /** Provider-specific sampling / generation parameters. */
   options?: Record<string, unknown>;
+  /**
+   * tkt_fbd9c979 — caller-side fallback ladder (layer 1 of the three-
+   * layer resolution in blur-providers-core's ProviderRegistry walker).
+   * Each entry is `{providerKind, modelId}` so cross-provider fallback
+   * (e.g. azure-foundry/kimi-k2.6 → anthropic/claude-haiku-4-5) is
+   * first-class at this layer. Empty array = explicit no-fallback.
+   *
+   * Propagates through chat.completions → D29 adapter →
+   * core SendMessageOptions.fallbackList. When undefined, the walker
+   * falls through to layer 2 (runtime.config 'fallbackOverrides') and
+   * layer 3 (curator-side default).
+   */
+  fallbackList?: Array<{ providerKind: string; modelId: string }>;
+  /**
+   * tkt_fbd9c979 — skip the curator-side default (layer 3) when neither
+   * layer 1 nor layer 2 is set. Lets callers force "fail loud"
+   * semantics — useful for repro / smoke runs where silent substitution
+   * would mask the failure they're trying to observe.
+   */
+  disableCuratedFallback?: boolean;
 }
 
 /** Reserved for future native-tool-calling. v1 ignores `tools`. */
@@ -728,11 +748,22 @@ export class ChatCompletionsSubsystem {
     // adapters that prefer opts.model over agent.provider.model pick
     // it up. Provider-specific options (sampling, etc.) ride on the
     // agent's provider record.
+    //
+    // tkt_fbd9c979 — forward fallbackList / disableCuratedFallback
+    // from ModelSpec so the D29 adapter can thread them into
+    // blur-providers-core's ProviderRegistry.send() as the caller-
+    // side layer-1 of the three-layer fallback resolution.
     const sendResult = await impl.sendMessage(
       syntheticAgent,
       {
         text: opts.promptText,
         model: opts.model.modelId,
+        ...(opts.model.fallbackList !== undefined
+          ? { fallbackList: opts.model.fallbackList }
+          : {}),
+        ...(opts.model.disableCuratedFallback !== undefined
+          ? { disableCuratedFallback: opts.model.disableCuratedFallback }
+          : {}),
       },
       this.repliesRef,
     );

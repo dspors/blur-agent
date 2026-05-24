@@ -625,6 +625,24 @@ export interface SendMessageOpts {
    * dispatch time (D29 adapter → blur-providers-core) consume it.
    */
   model?: string;
+  /**
+   * tkt_fbd9c979 — caller-side fallback ladder (layer 1 of the three-
+   * layer resolution). Passed through to blur-providers-core's
+   * ProviderRegistry.send() via the D29 adapter. When present, the
+   * walker uses it INSTEAD of runtime.config 'fallbackOverrides' AND
+   * the curator-side default. Empty array = explicit no-fallback.
+   *
+   * Mirrors the field of the same name on
+   * blur-providers-core/SendMessageOptions.
+   */
+  fallbackList?: Array<{ providerKind: string; modelId: string }>;
+  /**
+   * tkt_fbd9c979 — skip the curator-side default when neither layer 1
+   * (fallbackList) nor layer 2 (runtime.config overrides) is set. Lets
+   * the caller force "fail loud" semantics. Mirrors the field of the
+   * same name on blur-providers-core/SendMessageOptions.
+   */
+  disableCuratedFallback?: boolean;
 }
 
 /** Options for `agents.getReply()`. */
