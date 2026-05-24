@@ -13,6 +13,16 @@
  * project directory). Resourcing is the Scheduler's job.
  */
 
+import type { AgentProvider } from './types';
+
+/**
+ * Single source of truth for the provider-kind union — re-exported from
+ * AgentProvider so this file and types.ts can never drift. Adding a new
+ * provider (e.g. 'azure-foundry') happens in types.ts; everything that
+ * references SchedulerProviderKind picks it up automatically.
+ */
+export type SchedulerProviderKind = AgentProvider['kind'];
+
 // ===========================================================================
 // WorkItem
 // ===========================================================================
@@ -70,7 +80,7 @@ export interface WorkItem {
    * Provider-kind preference. The scheduler uses this when there's no
    * preferredAgentId — e.g., route secretary-pass to 'together' agents.
    */
-  preferredProviderKind?: 'bridge' | 'together' | 'openai' | 'local' | 'mock';
+  preferredProviderKind?: SchedulerProviderKind;
 
   // ----- Scheduler constraints (MUST honor) -----
 

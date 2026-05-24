@@ -63,6 +63,24 @@ import { composePrefix } from './prefix-composer';
 export type LayerName = string;
 
 /**
+ * OpenAI-aligned multimodal content part (one entry inside a ChatMessage
+ * with array content). Shape is permissive — `type: 'text' | 'image_url' |
+ * 'input_audio' | 'tool_result' | …` covers the full OpenAI surface.
+ *
+ * v1 chat.completions reduces array content to its text parts before
+ * dispatching (see `flattenMessages`); image / audio parts ARE DROPPED
+ * with a console warning at the boundary today. Callers needing true
+ * end-to-end multimodal should use `runtime.providers.send` directly
+ * until multimodal-through-chat-completions lands.
+ */
+export interface ChatMessageContentPart {
+  type: string;
+  text?: string;
+  image_url?: { url: string; detail?: string };
+  [key: string]: unknown;
+}
+
+/**
  * OpenAI-aligned chat message. Used throughout context history and
  * inside ChainResult.messages.
  *
@@ -70,10 +88,15 @@ export type LayerName = string;
  * messages) are reserved for future native-tool-calling support. v1
  * leaves them unset and represents tag execution via the assistant's
  * text content + b:s-result blocks (current behaviour).
+ *
+ * `content` accepts a plain string OR an array of multimodal parts.
+ * The v1 dispatcher extracts text parts from array content; non-text
+ * parts (images, audio) are dropped with a warning — full multimodal
+ * pass-through is a future enhancement.
  */
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string;
+  content: string | ChatMessageContentPart[];
   /** Reserved for future native-tool-calling support. */
   tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>;
   /** Reserved for future native-tool-calling support. */

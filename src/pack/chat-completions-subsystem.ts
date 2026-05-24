@@ -400,7 +400,10 @@ export class ChatCompletionsSubsystem {
         : {}),
       contextLayers: baseContext.layers.size,
       contextBytes: baseContext.describe().totalBytes,
-      promptBytes: messages.reduce((a, m) => a + Buffer.byteLength(m.content, 'utf8'), 0),
+      promptBytes: messages.reduce(
+        (a, m) => a + messageByteLength(m),
+        0,
+      ),
     });
 
     try {
@@ -628,11 +631,13 @@ export class ChatCompletionsSubsystem {
     }
 
     // finalReply = last assistant message content (or empty if no
-    // iteration ran).
+    // iteration ran). Assistant messages are always string-content in v1
+    // (provider responses arrive as text), but the type widening for
+    // multimodal user-input means we must extract text defensively.
     let finalReply = '';
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role === 'assistant') {
-        finalReply = messages[i].content;
+        finalReply = extractTextFromContent(messages[i].content);
         break;
       }
     }
@@ -1001,19 +1006,79 @@ function normalizePrompt(prompt: string | ChatMessage[]): ChatMessage[] {
  *   \n──\n
  *   user: <new prompt>
  *
+ * Multimodal content: when a message's `content` is an array, only its
+ * text parts are kept; image/audio/non-text parts are DROPPED with a
+ * one-time console warning (see `extractTextFromContent`). Callers
+ * needing full multimodal should use `runtime.providers.send` directly.
+ *
  * Byte-deterministic given identical messages.
  */
 function flattenMessages(messages: ChatMessage[]): string {
   const parts: string[] = [];
   for (const m of messages) {
+    const text = extractTextFromContent(m.content);
     if (m.role === 'system') {
       // System content goes verbatim at the top; no role prefix.
-      parts.push(m.content);
+      parts.push(text);
     } else {
-      parts.push(`${m.role}: ${m.content}`);
+      parts.push(`${m.role}: ${text}`);
     }
   }
   return parts.join('\n──\n');
+}
+
+/** Track whether we've already emitted the multimodal-dropped warning. */
+let multimodalWarned = false;
+
+/**
+ * Extract text content from a ChatMessage's `content` field. When
+ * content is a string, return as-is. When content is an array
+ * (multimodal), concatenate text parts and DROP non-text parts.
+ * Emits a single deprecation warning on first multimodal encounter so
+ * the caller knows their images aren't reaching the provider via the
+ * chat.completions path.
+ */
+function extractTextFromContent(content: ChatMessage['content']): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  let droppedNonText = false;
+  const textParts: string[] = [];
+  for (const part of content) {
+    if (part && typeof part === 'object') {
+      if (typeof part.text === 'string') {
+        textParts.push(part.text);
+      } else if (part.type !== 'text') {
+        droppedNonText = true;
+      }
+    }
+  }
+  if (droppedNonText && !multimodalWarned) {
+    multimodalWarned = true;
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[chat.completions] Non-text content parts (image_url / input_audio / etc.) ' +
+      'dropped at the v1 dispatcher boundary — only text parts forwarded to the ' +
+      'provider. For full multimodal support, call runtime.providers.send directly. ' +
+      '(This warning fires once per process.)',
+    );
+  }
+  return textParts.join('');
+}
+
+/**
+ * Byte length of a single ChatMessage's content. Handles both plain
+ * string and array (multimodal) content. For arrays, measures the
+ * JSON-serialized form — what gets sent over the wire when multimodal
+ * is plumbed through a provider that supports it. (Today the v1
+ * dispatcher flattens to text first, so the actual transmitted bytes
+ * may be smaller; this byte count remains an UPPER bound suitable for
+ * audit / quota purposes.)
+ */
+function messageByteLength(m: ChatMessage): number {
+  if (typeof m.content === 'string') {
+    return Buffer.byteLength(m.content, 'utf8');
+  }
+  return Buffer.byteLength(JSON.stringify(m.content), 'utf8');
 }
 
 // ============================================================================

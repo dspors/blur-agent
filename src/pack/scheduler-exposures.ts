@@ -18,7 +18,7 @@ export const schedulerExposures: MethodExposure[] = [
     method: 'submit',
     primitivePath: 'agents.scheduler.submit',
     signature:
-      "(opts: { workRef: { kind: string; ref: string }; priority?: number; submittedBy: string; preferredAgentId?: string; preferredProviderKind?: 'bridge'|'together'|'openai'|'local'|'mock'; requiredRole?: string; requiredCapabilities?: { vision?: boolean; toolUse?: 'native'|'unsupported'|'limited' }; contextScope?: { projectId?: string; engagementId?: string; activityKind?: string } }): WorkItem",
+      "(opts: { workRef: { kind: string; ref: string }; priority?: number; submittedBy: string; preferredAgentId?: string; preferredProviderKind?: 'bridge'|'together'|'openai'|'local'|'mock'|'anthropic'|'azure-foundry'; requiredRole?: string; requiredCapabilities?: { vision?: boolean; toolUse?: 'native'|'unsupported'|'limited' }; contextScope?: { projectId?: string; engagementId?: string; activityKind?: string } }): WorkItem",
     description:
       'Submit a WorkItem to the scheduler. Default priority=50. The scheduler ' +
       'immediately attempts assignment; if no eligible idle agent, the item ' +
@@ -109,7 +109,7 @@ export const schedulerExposures: MethodExposure[] = [
     method: 'setRoutingPolicy',
     primitivePath: 'agents.scheduler.routing.set',
     signature:
-      "(opts: { entry: { kind: string; defaultProviderKind?: 'bridge'|'together'|'openai'|'local'|'mock'; sticky?: boolean; fallbackProviderKind?: 'bridge'|'together'|'openai'|'local'|'mock'; hints?: Record<string, unknown> }; by?: string }): RoutingPolicyEntry",
+      "(opts: { entry: { kind: string; defaultProviderKind?: 'bridge'|'together'|'openai'|'local'|'mock'|'anthropic'|'azure-foundry'; sticky?: boolean; fallbackProviderKind?: 'bridge'|'together'|'openai'|'local'|'mock'|'anthropic'|'azure-foundry'; hints?: Record<string, unknown> }; by?: string }): RoutingPolicyEntry",
     description:
       'Set the routing policy for an activity kind. Tells the scheduler which provider ' +
       'to prefer when no preferredAgentId / preferredProviderKind is on the WorkItem. ' +
