@@ -22,7 +22,7 @@
  * agents.roles.register at runtime.
  */
 
-import type { LibraryPack, LibraryPackInstall, BlurAIRuntime } from 'blur-ai-runtime';
+import type { LibraryPack, LibraryPackInstall, BlurAIRuntime, PackAbout } from 'blur-ai-runtime';
 
 import { AgentsSubsystem } from './agents-subsystem';
 import { AgentRepliesSubsystem } from './replies-subsystem';
@@ -237,9 +237,30 @@ interface InstalledSubsystems {
 }
 const installedByRuntime: WeakMap<BlurAIRuntime, InstalledSubsystems> = new WeakMap();
 
+const about: PackAbout = {
+  purpose:
+    'Durable agent identity + dispatch — runtime.agents.* (lease/bind/roles/' +
+    'notes), runtime.replies.* (Decision 29 reply store), runtime.chat.* and ' +
+    'the scheduler/engagement-flow/run/secretary surfaces. Dispatches messages ' +
+    'to inference targets via an open ProviderRegistry.',
+  namespace: 'agents',
+  kind: 'capability',
+  repo: 'blur-agent',
+  tags: ['agents', 'identity', 'dispatch', 'roles', 'scheduler', 'engagement-flow'],
+  summary:
+    'Mounts a cluster of coordinated subsystems (agents/replies/turns/scheduler/' +
+    'providers/engagement-flow/chat-completions/fs-exec/context/run/secretary). Seeds ' +
+    'the canonical role catalog; BridgeProvider delegates to runtime.bridge.sessions.*. ' +
+    'Agent entities ride the entities channel (Decision 37).',
+  maturity: 'beta',
+  since: '0.4.0',
+  docs: ['SA-agent-dispatch', 'SA-scheduler', 'agent-roles'],
+};
+
 const pack: LibraryPack = {
   id: 'blur-agent',
   version: '0.4.0',
+  about,
 
   install(runtime: BlurAIRuntime): LibraryPackInstall {
     const agents = new AgentsSubsystem(runtime);
