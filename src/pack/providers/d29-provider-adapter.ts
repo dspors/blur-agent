@@ -94,6 +94,46 @@ interface InnerProvider {
 
 interface RuntimeShape {
   extensions?: { get?: (name: string) => unknown };
+  /**
+   * S4: optional audit.skipReason. When present, we route unexpected
+   * `extensions.get` throws through here instead of silently swallowing.
+   * Optional so the back-compat path works on older host runtimes.
+   */
+  audit?: {
+    skipReason?: (opts: {
+      source: string;
+      intended: string;
+      error?: unknown;
+      detail?: Record<string, unknown>;
+    }) => void;
+  };
+}
+
+/**
+ * Back-compat wrapper around runtime.audit.skipReason. Prefers the host
+ * helper when available; otherwise console.warn with the same wire shape.
+ * Identical pattern to blur-document/src/pack/index.ts reportSkip. See
+ * PACK-AUTHORS §1.6 and the staged-plan Brief S4 entry.
+ */
+function reportSkip(
+  runtime: RuntimeShape,
+  opts: { source: string; intended: string; error?: unknown; detail?: Record<string, unknown> },
+): void {
+  const skipReason = runtime.audit?.skipReason;
+  if (typeof skipReason === 'function') {
+    skipReason(opts);
+    return;
+  }
+  const msg =
+    opts.error instanceof Error
+      ? opts.error.message
+      : typeof opts.error === 'string'
+        ? opts.error
+        : opts.error !== undefined
+          ? JSON.stringify(opts.error)
+          : '(no error supplied)';
+  // eslint-disable-next-line no-console
+  console.warn(`[skip] ${opts.source}: ${opts.intended} — ${msg}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -394,11 +434,26 @@ export function installD29Adapters(
 function getInnerRegistry(runtime: RuntimeShape): InnerProviderRegistry | null {
   try {
     const ext = runtime?.extensions?.get?.('providerRegistry');
+    // Soft nulls — registry not loaded yet or extension has the wrong
+    // shape. These are EXPECTED in the lazy-resolver design (we re-check
+    // on every call). Returning null silently is correct here; logging
+    // each miss would flood the audit log.
     if (!ext || typeof ext !== 'object') return null;
     const r = ext as InnerProviderRegistry;
     if (typeof r.send !== 'function' && typeof r.get !== 'function') return null;
     return r;
-  } catch {
+  } catch (err) {
+    // Unexpected throw from `extensions.get` itself — that's a real
+    // surprise (the extensions surface has a bug). Surface it so the
+    // operator can debug rather than silently treat it as "registry
+    // missing". S4 in runtime-critical-issues-staged-plan; the keystone
+    // tkt_5faf0c33 originally pointed at THIS catch-and-swallow as a
+    // canonical instance of Root B (silent skips at cross-surface seams).
+    reportSkip(runtime, {
+      source: 'blur-agent/d29-provider-adapter/getInnerRegistry',
+      intended: "resolve runtime.extensions.get('providerRegistry') for D29 fallback dispatch",
+      error: err,
+    });
     return null;
   }
 }

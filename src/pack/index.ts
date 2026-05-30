@@ -376,8 +376,24 @@ const pack: LibraryPack = {
     for (const entry of SEEDED_ROUTING) {
       try {
         scheduler.setRoutingPolicy({ entry, by: 'blur-agent@install' });
-      } catch {
-        /* swallow */
+      } catch (e) {
+        // S4: surface unexpected setRoutingPolicy failures via the
+        // audit feed rather than swallowing. Use the optional host
+        // helper when available; console.warn back-compat otherwise.
+        const skip = (runtime as { audit?: { skipReason?: Function } })?.audit?.skipReason;
+        const opts = {
+          source: 'blur-agent/install/seedRoutingPolicy',
+          intended: `seed routing policy for activity kind='${entry.kind}'`,
+          error: e,
+          detail: { entry },
+        };
+        if (typeof skip === 'function') {
+          (skip as (o: typeof opts) => void)(opts);
+        } else {
+          const msg = e instanceof Error ? e.message : String(e);
+          // eslint-disable-next-line no-console
+          console.warn(`[skip] ${opts.source}: ${opts.intended} — ${msg}`);
+        }
       }
     }
 
