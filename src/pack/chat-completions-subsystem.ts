@@ -426,6 +426,18 @@ export class ChatCompletionsSubsystem {
       ),
     });
 
+    // Phase A.5a — open capture_chain row. Best-effort: missing
+    // CaptureStore / JobsSubsystem / scriptRunId all silently skip
+    // persistence. Provides the chain_id FK target that capture_turn
+    // rows reference via AuditFrame.chainContext (set per-iter below).
+    const chainCapture = this.openChainCapture_(
+      chainId,
+      messages,
+      opts.allowedTags ?? null,
+      Array.from(credentialMap.keys()),
+    );
+    const perIterTagResults: Array<Record<string, unknown>> = [];
+
     try {
       // Loop. Each iteration calls the provider, parses the reply,
       // either terminates (script-free) or executes tags + dispatches
@@ -451,6 +463,12 @@ export class ChatCompletionsSubsystem {
 
         // Call the provider. Throws on hard error; we capture and
         // terminate with provider-error.
+        // Phase A.5a — stamp chainContext on the AuditFrame around the
+        // dispatch so downstream capture_turn writes pick up chain_id +
+        // iter via ALS. Cleared in finally so the frame stays clean
+        // between iters.
+        const frame = this.audit_()?.currentFrame();
+        if (frame) frame.chainContext = { chainId, iter };
         let replyText: string;
         try {
           replyText = await this.invokeProvider({
@@ -464,7 +482,10 @@ export class ChatCompletionsSubsystem {
           terminationReason = 'provider-error';
           error = (err as Error)?.message ?? String(err);
           this.emit('chat.completions.provider-error', { chainId, iter, error });
+          if (frame) delete frame.chainContext;
           break;
+        } finally {
+          if (frame) delete frame.chainContext;
         }
 
         const replyBytes = Buffer.byteLength(replyText, 'utf8');
@@ -648,6 +669,15 @@ export class ChatCompletionsSubsystem {
       // Phase 3 — release the per-chain scrub map. Done AFTER the
       // final emit so the completed event still scrubs.
       this.chainScrubs.delete(chainId);
+      // Phase A.5a — close the capture_chain row.
+      this.closeChainCapture_(
+        chainCapture,
+        iterations,
+        terminationReason,
+        Date.now() - startedAt,
+        error,
+        perIterTagResults,
+      );
     }
 
     // finalReply = last assistant message content (or empty if no
@@ -1000,6 +1030,156 @@ export class ChatCompletionsSubsystem {
 
   /** Per-chain scrub maps. Populated in create() at chain start, cleared in `finally`. */
   private chainScrubs: Map<string, Array<{ value: string; alias: string }>> = new Map();
+
+  // ---------------------------------------------------------------------
+  // Phase A.5a — capture_chain open/close + AuditFrame accessor.
+  // ---------------------------------------------------------------------
+
+  /** Defensive runtime.audit accessor for chainContext stamping. */
+  private audit_(): {
+    currentFrame: () => { chainContext?: { chainId: string; iter: number } } | undefined;
+  } | null {
+    try {
+      const a = (this.runtime as unknown as {
+        audit?: {
+          currentFrame: () => { chainContext?: { chainId: string; iter: number } } | undefined;
+        };
+      }).audit;
+      return a ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Insert a capture_chain row at chain start. Reads JobContext +
+   * scriptRunId via ALS (runtime.jobs.current() + AuditFrame.scriptRunId).
+   * Returns null when persistence is unavailable — caller treats
+   * everything chain-capture as no-op. Wire failures never block the
+   * chain.
+   */
+  private openChainCapture_(
+    chainId: string,
+    initialMessages: ChatMessage[],
+    allowedTags: string[] | null,
+    credentialAliases: string[],
+  ): { id: string; startedAtMs: number } | null {
+    try {
+      const r = this.runtime as unknown as {
+        jobs?: {
+          captures?: {
+            insertChain(row: {
+              id: string;
+              jobId: string;
+              scriptRunId: string;
+              startedAt: string;
+              callerOrigin: string;
+              engagementId: string | null;
+              agentId: string | null;
+              systemPrefix: string | null;
+              systemPrefixHash: string | null;
+              allowedTags: string | null;
+              credentialAliases: string | null;
+              contextLayersHash: string | null;
+            }): number;
+          };
+          current?: () => { id: string } | null;
+        };
+        audit?: { currentFrame?: () => { scriptRunId?: string } | undefined };
+      };
+      const captures = r.jobs?.captures;
+      const job = r.jobs?.current?.();
+      const scriptRunId = r.audit?.currentFrame?.()?.scriptRunId;
+      if (!captures || !job || !scriptRunId) return null;
+
+      // Extract the system prefix (first system message) from the
+      // initial messages array. Stored ONCE per chain.
+      const systemPrefix = initialMessages
+        .filter((m) => m.role === 'system')
+        .map((m) => (typeof m.content === 'string' ? m.content : ''));
+      const systemPrefixText = systemPrefix.length > 0 ? JSON.stringify(systemPrefix) : null;
+
+      captures.insertChain({
+        id: chainId,
+        jobId: job.id,
+        scriptRunId,
+        startedAt: new Date().toISOString(),
+        callerOrigin: 'chat.completions',
+        engagementId: null,
+        agentId: null,
+        systemPrefix: systemPrefixText,
+        systemPrefixHash: null,
+        allowedTags: allowedTags && allowedTags.length > 0 ? JSON.stringify(allowedTags) : null,
+        credentialAliases:
+          credentialAliases.length > 0 ? JSON.stringify(credentialAliases) : null,
+        contextLayersHash: null,
+      });
+      return { id: chainId, startedAtMs: Date.now() };
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[chat.completions] openChainCapture_ failed (continuing):', err);
+      return null;
+    }
+  }
+
+  /**
+   * Close the capture_chain row with final iter count + termination
+   * reason + per-iter tag results + accumulated usage. Best-effort.
+   */
+  private closeChainCapture_(
+    capture: { id: string; startedAtMs: number } | null,
+    iterations: IterationRecord[],
+    terminationReason: ChainResult['terminationReason'],
+    totalDurationMs: number,
+    error: string | undefined,
+    perIterTagResults: Array<Record<string, unknown>>,
+  ): void {
+    if (!capture) return;
+    try {
+      const r = this.runtime as unknown as {
+        jobs?: {
+          captures?: {
+            endChain(update: {
+              id: string;
+              endedAt: string;
+              iterCount: number;
+              terminationReason: string | null;
+              finalReply: string | null;
+              error: string | null;
+              totalDurationMs: number;
+              totalPromptTokens: number;
+              totalCompletionTokens: number;
+              totalCostEstimate: number;
+              tagResults: string | null;
+            }): void;
+          };
+        };
+      };
+      const captures = r.jobs?.captures;
+      if (!captures) return;
+
+      // Sum usage across iterations from the tag results / iteration records.
+      // Token totals come from capture_turn rows (already aggregated by the
+      // accounting triggers on capture_job); chain-level total stays 0 here
+      // (consumers can SUM capture_turn.usage WHERE chain_id = ?).
+      captures.endChain({
+        id: capture.id,
+        endedAt: new Date().toISOString(),
+        iterCount: iterations.length,
+        terminationReason,
+        finalReply: null,
+        error: error ?? null,
+        totalDurationMs,
+        totalPromptTokens: 0,
+        totalCompletionTokens: 0,
+        totalCostEstimate: 0,
+        tagResults: perIterTagResults.length > 0 ? JSON.stringify(perIterTagResults) : null,
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[chat.completions] closeChainCapture_ failed:', err);
+    }
+  }
 }
 
 // ============================================================================
