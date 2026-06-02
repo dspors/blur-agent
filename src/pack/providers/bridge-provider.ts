@@ -49,6 +49,26 @@ import type { Agent, BridgeProvider, SendMessageOpts } from '../types';
 import type { AgentRepliesSink, ProviderImpl } from '../provider-registry';
 import type { BlurAIRuntime } from 'blur-ai-runtime';
 
+/**
+ * Minimal shape of the stateless BridgeProvider host-object (registered by
+ * blur-providers-bridge) we reach via runtime.extensions.get('bridgeProvider').
+ * Used by the auto-anon-lease path below when no sessionId is bound on the
+ * agent. The exposed methods are `acquireForChain` (single-opts shape) and
+ * `releaseChain` — NOT the raw acquireThread/releaseThread on the underlying
+ * BridgeProvider class. See blur-providers/packages/bridge/src/pack/index.ts.
+ */
+interface StatelessBridgeProviderShape {
+  acquireForChain(opts: {
+    chainId: string;
+    host?: string | null;
+    model?: string;
+    role?: string;
+    preamble?: string;
+    callerLabel?: string;
+  }): Promise<{ sessionId: string; model?: string; role?: string }>;
+  releaseChain(chainId: string): boolean;
+}
+
 interface BridgeRuntimeShape {
   sessions: {
     requestReply: (
@@ -141,11 +161,6 @@ export function bridgeProviderImpl(runtime: BlurAIRuntime): ProviderImpl {
         );
       }
       const bp = provider as BridgeProvider;
-      if (!bp.sessionId) {
-        throw new Error(
-          `bridge provider for agent ${agent.id}: provider.sessionId is required`,
-        );
-      }
 
       // Pack-to-pack reach via the runtime extensions registry (same
       // pattern AgentsSubsystem uses for pool). Decision 17 + 18 —
@@ -161,9 +176,52 @@ export function bridgeProviderImpl(runtime: BlurAIRuntime): ProviderImpl {
         );
       }
 
+      // Auto-anon-lease path (Phase B.6.1 — 2026-06-01):
+      // When the agent has no provider.sessionId bound, mirror the
+      // stateless BridgeProvider.sendMessage behavior and acquire an
+      // anon lease via the stateless impl. This unlocks chat.completions
+      // → bridge for Proceedings + any other agent-bound caller that
+      // doesn't pre-lease (e.g. synthetic chat-completions agents have
+      // no upstream owner to assign a session).
+      //
+      // Pattern: acquireThread (anon when no role context) → use the
+      // returned sessionId as targetSessionId → existing streaming path
+      // → releaseThread on completion (anon persists; the lease is just
+      // an acquire/release accounting handle).
+      let leasedChainId: string | null = null;
+      let effectiveSessionId: string;
+      if (bp.sessionId) {
+        effectiveSessionId = bp.sessionId;
+      } else {
+        const statelessBridge = extensions?.get('bridgeProvider') as
+          | StatelessBridgeProviderShape
+          | undefined;
+        if (!statelessBridge?.acquireForChain) {
+          throw new Error(
+            `bridge provider for agent ${agent.id}: provider.sessionId is missing AND ` +
+            `runtime.extensions.get("bridgeProvider").acquireForChain is unavailable. ` +
+            'Either bind a sessionId on the agent (real-runner workflows) or ensure ' +
+            'the blur-providers-bridge pack is loaded (auto-anon-lease workflows).',
+          );
+        }
+        leasedChainId = `agent-bound::${agent.id}::${Date.now().toString(36)}`;
+        // `provider.model` lives on synthetic chat.completions agents
+        // (chat-completions-subsystem stamps it) but isn't declared on
+        // the BridgeProvider type. Read it via a structural cast.
+        const modelHint =
+          (provider as unknown as { model?: string }).model ?? 'sonnet';
+        const lease = await statelessBridge.acquireForChain({
+          chainId: leasedChainId,
+          host: null,
+          model: modelHint,
+          callerLabel: `chat.completions/${agent.id}`,
+        });
+        effectiveSessionId = lease.sessionId;
+      }
+
       const bOpts = opts as BridgeSendMessageOpts;
-      const targetSessionId = bOpts.toSessionId || bp.sessionId;
-      const bridgeKey = `bk_${bp.sessionId}`;
+      const targetSessionId = bOpts.toSessionId || effectiveSessionId;
+      const bridgeKey = `bk_${effectiveSessionId}`;
       const requestAt = new Date().toISOString();
 
       // Mint the LOCAL record first so we have a handle to return even
@@ -177,7 +235,9 @@ export function bridgeProviderImpl(runtime: BlurAIRuntime): ProviderImpl {
 
       // Fire the upstream requestReply asynchronously so this function
       // returns the local handle promptly. Chunks arrive via the poll
-      // loop below.
+      // loop below. If we acquired an auto-anon lease above, release it
+      // after the upstream poll terminates (success OR failure path)
+      // so the BridgeProvider's accounting stays correct.
       (async () => {
         let upstreamHandle: string | null = null;
         try {
@@ -194,10 +254,6 @@ export function bridgeProviderImpl(runtime: BlurAIRuntime): ProviderImpl {
             );
           }
           upstreamHandle = envelope.replyHandle;
-          // Stamp upstream handle on local record by appending a meta chunk.
-          // (We can't mutate the record directly through the sink; an
-          // implementation extension could add an attachUpstream() method
-          // if desired. For now the meta chunk records the linkage.)
           replies.appendChunk(localRecord.handle, [
             {
               kind: 'meta',
@@ -210,11 +266,25 @@ export function bridgeProviderImpl(runtime: BlurAIRuntime): ProviderImpl {
               at: new Date().toISOString(),
             },
           ]);
-          // Begin polling loop.
           await pollUpstream(bridgeApi, upstreamHandle, localRecord.handle, replies, bOpts.host);
         } catch (err) {
           const msg = (err as Error)?.message ?? String(err);
           replies.fail(localRecord.handle, msg);
+        } finally {
+          // Release the auto-anon lease (no-op for caller-bound sessions).
+          if (leasedChainId) {
+            try {
+              const statelessBridge = extensions?.get('bridgeProvider') as
+                | StatelessBridgeProviderShape
+                | undefined;
+              statelessBridge?.releaseChain?.(leasedChainId);
+            } catch (releaseErr) {
+              // eslint-disable-next-line no-console
+              console.warn(
+                `[bridge-adapter] releaseThread failed for ${leasedChainId}: ${(releaseErr as Error)?.message ?? releaseErr}`,
+              );
+            }
+          }
         }
       })();
 
